@@ -1,0 +1,233 @@
+NIGHTMARE CHEATSHEET
+
+I advise you to read it if you already have anything knowledge about PWN... but you can find out something new what will be interesting to learn
+At the down of this article you can find anyone contretic exploitation cases including which I was faced 
+And sorry about my not properly English :)
+
+# 1. Basics
+
+	## 1.1 x86_64 calling conversation :
+		if a function wait provides of no more than 6 arguments, arguments put into with :
+			1. rdi
+			2. rsi
+			3. rdx
+			4. rcx
+			5. r8
+			6. r9
+		else remainder put into the stack
+		
+		and for syscall (syscall number in rax):
+			1. rdi
+			2. rsi
+			3. rdx
+			4. r10
+			5. r8
+			6. r9
+		
+		so, if we want to 'hack' any program we must understand how it works. For example : if I could replace something function to "system()" I need to put arg to rdi for propertly call
+		
+	## 1.2 Stack layout :
+		stack includes :
+			1. Buffer
+			2. Stack frame pointer
+			3. Return address
+			
+		buffer == our data, sfp == address of previous sfp (to returning after callbacks was correct) and return address == address where we'll be after end of a function. [ret = pop rip]
+		
+		if we can control length of buffer and can go out from buffer's size range, we can rewrite neighbour data including sfp & return address ==> we can transfer control anywhere --x address
+		this is a basic of ROP
+		
+		The latest data in the stack has the lowest
+		
+	## 1.3 Endiannes :
+		anyone data was read/wrote with little-endian notation (excluding network stack), because it makes more easy to extend range of integers and do ariphmetical operations (from the lowest bytes to the highest)
+		
+		example: in 64 chunk of memory 0xdeadbeefcafebabe will become 0xbebafecaefbeadde ==> important to pack our data propertly (addresses especially)
+		
+	## 1.4 ELF structure :
+		Anyone executable file at Linux has this structure :
+			1) Code segment [r-x as usual] - read & executable section. Collection of instruction to central processor unit
+			2) Data segment --> separating to 3 types :
+				> data [rw-] - read & write section. Static variables (C keyword). It keeps all image of data during all life of a process
+				> rodata [r--] - read section. Also static, but immutable variables. "Mechanical" protection ==> Any attemp to write = segfault
+				> bss [rw-] - blank static symbol - reserved data to variables. Keeps only addresses of variables instead whole image like data
+			3) Stack segment [rw- or rwx] - basically pool for our data. Sometimes, if protection of a programm totally shit it's executable. Includes stack frames
+			4) Heap segment [rw-] - a big pool to dynamic data. We can manipulate it with malloc/free
+			
+	## 1.5 Memory mappings :
+		Anyone programm on C includes :
+			1) Executable file with code & data segments & .plt & .got sections
+			2) Heap (if just one malloc was called)
+			3) Local-Thread Storage (includes important information about current thread, for example - address of tcache_perthread_struct)
+			4) Linked libc - our treasure with all ROP-gadgets, all functions and strings which need to exploitation
+			5) Linker - resolver for lazy binding
+			6) Stack - space for static data
+			
+	## 1.6 Common protections : 
+		With checksec utility you can find protections of your binary:
+			1) NX - NoteXecutable stack
+			2) ASLR - Adress Space Layout Randomization - any mapping excluding your binary file have randomized addresses
+			3) PIE - Position Independed Executable - your binary file deployed at a random address
+			4) RELRO - Relocation Read-Only - Protection something system data. For example .got .plt.got are [rw-] or [r--]
+			5) Canary - The stack value which control stack oferflows (basically random value with comparing after end of function)
+			
+# 2. Stack exploitation :
+	
+	## 2.1 Buffer overflow :
+		If you can control length of input you can go out from size range of one variable to rewrite data of neighbour variable
+		For example you can rewrite pointer to someone handler or method of structure
+		Don't forget about the later data has the lower address
+		
+	## 2.2 Stack overflow :
+		If you can control length of input to reach sfp & return address you just can rewrite last of them. If you do this, RIP will put into itself rewritten address and go to your instruction
+		For example : if any cases you can pass anything checkings to reach neseccary code fragment
+		
+	## 2.3 Return Oriented Programming :
+		If you have primitive to write data such size to rewrite not only return address you'll can make a ROP-chain.
+		ROP-chain - collection of assembly instructions to transfer control your own "code". As usual, ROP-chains assembling from binary (if all of necessary gadgets includes to binary) or from GLIBC (trust me you can find here anything for exploitations. Not only gadgets for ROP-chain)
+		
+		Example : after you maked sure that you can rewrite stack data as you need you can assembly ROP-chain. As usual it's length from 24 bytes to 64. We can don't be careful about data under return address, because after compliting our code we'll get a new valid stack context or even get reverse shell.
+		
+		pop rdi ; ret -> '/bin/sh\x00' address -> ret -> system("/bin/sh\x00")
+		
+		so, rdi will got an address of /bin/sh and system will give us a shell. But a lot of libc functions make operations like <movaps> which need 0x10 stack alignment. And return address isn't align at 0x10 and after put the ROP-chain to stack if we calling a libc function we'll must be sure that after calling stcak will be aligned at 0x10 (the lowest address % 0x10 == 0)
+		
+	## 2.4 Stack pivoting : 
+		If you find [ pop rsp ; ret | xchg rax, rsp ; ret ] or something like that (to handle the stack pointer) you'll can move rsp to control space (stack or heap - doesn't matter, just control data segment, even .data or .bss)
+		This can be useful if you can not rewrite such space after sfp to propertly ROP-chain. Just move your rsp to stack part which you already have prepared (put whole ROP-chain) and execute your "code"
+		
+		Example of the ROP-chain for stack-pivoting : pop rsp ; ret -> <data address> -> pop rax ; ret -> <execve syscall> -> pop rdi ; ret -> </bin/sh address> -> pop rsi ; ret -> <0 or args> -> pop rdx ; ret -> <0 or environ> -> syscall <=> We got a shell
+		
+		And I should tell about stack-red-zone (128 bytes under $rsp) - this place was used by kernel signals and it use this space for their metadata (after signal data at the stack can be currupted)
+		
+	## 2.5 Sigreturn Oriented Programming :
+		If you have primitive to write large data or can make stack-pivoting you can set registres without gadgets (you need just pop rax ; ret & syscall or pop rsp ; ret and address if you want to pivot stack)
+		So, you just need to put to data SIGCONTEXT structure. Library sigcontext.h includes signature of this structure. 
+		First of all you should to put your ROP-chain to top of the stack and after it put your sigcontext structure. After syscall kernel will takes you structure and set all registres (don't forget about segment registres) as you have written them to structure. And after those you can just call system() or another function.
+		But not only sigreturn syscall uses this concept. Fot example - setcontext() in the glibc.
+		
+	## 2.6 Partial overwrite : 
+		ASLR doesn't randomize last 12 bits of address and 8 first bits (PIE too) and you can just overwrite 12 last bits randomized address to last 12 bits of static offset and try to get target address (if difference between leaked and target belowe than 4096 bytes)
+		For example : you can rewrite 1 byte of address and you don't know address at the return address or address from .got section or smth else
+		
+# 3. Format string exploitation :
+
+	## 3.1 Arbitrary read : 
+		If program has printf without format string you'll can leak almost anything with your own format string. Look at the signature :
+			1) %p - print a pointer (if you put %p %p %p %p %p to buffer which using to printf - you'll get at stdout 5 pointers from stack during printf executing)
+			2) %s - print a string
+			3) %k$p - print pointer on RSP + (k * 8) position at the stack (%k$r works for anyone format-string prefix. It prints k-th element on stack with 'r' format)
+			
+		So, you can leak an address from stack, libc or heap and with GDB calculate base of those segments => calculate anyone data and instruction by fixed offset. As usual it is all what we need for exploitation 
+		
+	## 3.2 Arbitrary write :
+		If program also have format string vulnerability you can use "%n" prefix to write count of written bytes to stdout on address. It's so powerful equipment to scoping-rewriting of data (first of all - you can pass stack canary checking but rewrite return address)
+		
+		It has 3 variants :
+			1. "%n" write 4 or 8 bytes of output length	<==	I don't advise use it because to wirte 4 bytes of data. It's too large (stdout can't put such count of bytes > 0x10000000) 
+			2. "%hn" write 2 bytes of output length		<== 	Probably good for one partial overwrite. Still 0x1000 < bytes but already not bad
+			3. "%hhn" write 1 byte of output length		<== 	Ok! So accurate way to rewrite bytes, but it need longer payload
+		
+		Example : you leaked stack address and calculated target. So, you can assembly payloas like this : "%'a'c%'k'$hhn" + "%'b - a'c%'k'$hhn" + ... + <address of 1st byte> + <address of 2nd byte> + ... + <address of n-th byte>
+		%ac puts a chars (0x20 as usual) and %k$hhn put 'a' to k-th address on the stack. First of all you need to check which position your buffer has at the stack and after this find your 'k' for each address. 
+		And you should to read what your own format string includes. To find correct "k". 
+		Don't forget make a subtraction of second and other %bc (b = your value - a), because %n write length of only printable characters - it's passing format strings. And after first writing "counter" added 'a' to itself
+		
+# 3. Heap Exploitation
+
+	## 3.1 Chunk structure :
+		1) prev_size (8 bytes) - it's used to put here address of free upper chunk. If upper chunk isn't free, prev_size field can be rewrote of upper-chunk's data
+		2) size (8 bytes with flags) - it's used to save own size of chunk. Always it more than malloc(size) at 0x10 (0x10 == sizeof(chunk_header)). Also it includes flags. 
+		3) flags (3 lowest bits):
+			1. PREV_INUSE equals 1 if upper chunk doesn't free. Else 0. Lowest bit [0]
+			2. IS_MAPPED equals 1 if current chunk mapped with MMAP syscall. Else 0. Second bit from lowest [1]
+			3. NOT_MAIN_ARENA equals 1 if current chunk not allocated from current thread. Else 0. Highest bit from 3 lowest [2]
+			
+		4) forward chunk - address of next chunk
+		5) backward chunk - address of backward chunk
+		
+		P.s Tcache & fastbin have Save-Linked concept which means that "raw addresses" don't decide at the fd / bk. 
+		Save linked aka mangling address calculating by this formula : (current_address SHR 12) XOR target address (SHR == Shift Right) 
+
+		Also tcache & fastbin are cyclic-one-side list, so only fd pointer used to. However, tcache have a special key which putting after free() if freed chunk pushed into tcache
+		
+	## 3.2 Pools and bins for freed chunks
+		1) tcache - fast cache for fast push/pop chunks. LIFO. Includes 64 dword wirtings about count of chunks in the bins & 64 entries field aka next free chunk
+		
+		pseudostructure of tps:
+		
+		tcache_perthread_struct = {
+			uint16_t counts[64];
+			uint64_t entries[64];
+		}
+		
+		where counts has range [0, 7] (max 7 chunks at a bin) and entries include address of a next chunk for allocation. So, size of tps is : 2 * 64 + 8 * 64 = 640 = 0x280 bytes as ususal (maybe it has alignment, be sure that you are working with properly size. With flag PREV_INUSE it equals 0x281 bytes
+		
+		after free() if chunk was pushed to tcache bin 2nd qword becomes a Save-Linked address of next free chunk and 3rd qword becomes a key of tps (it was randomized at each starting of a programm and saving at LOCAL THREAD STRUCTURE. Cause of it - saving heap from double free vulnerability. So, after free() tcache was checked : (is current chunk has a 3rd qword which equals to key) ? [tcache_dup error] : [successfully pushing]
+		
+		P.s forward pointer points to 2nd qword of chunk (always 2nd - 3rd qwords - allocator's data) but upper chunk has "header" which includes PREV_SIZE & SIZE fields.
+		
+		2) fastbin - also quick pool to push/pop chunks, but chunk are going here if only appropriate bin int the tcache already fulled. Range of sizes which can be pushed to fastbin : [0x10 - 0x80]. Also LIFO - cyclic-one-binded list. Also has save-linking but hasn't key. Potentially struct for double free (fustbin_dup vulnerability - we'll look at this later)
+		
+		3) Main arena bins :
+			3.1) Unsorted bin (index == 1) - this place is FIFO cyclic-two-binded list. If chunk with appropriate size already doesn't fit to tcahce bin & fastbin (or it's size above than 0x80 bytes) it was pushed to Unsoted bin or absolutely equalification in the tcache & fastbin not found, so we go to the check : if unsorted / small / large bins include chunks which size of chunk more than user required ==> chunk will be separated and chunk with required size will be returned to user and remainder will be pushed to unsorted bin. Last freed chunk will be put between head and last freed chunk.
+			
+			3.2) Small bins (indexes 2 - 63) - stores exact size classes from 16 bytes to 512 bytes (on 64-bit arch, step 16 bytes). If tcache bin for specific size is full (default max 7 chunks), the excess chunks are evicted and pushed to the corresponding small bin. Structure is a FIFO doubly linked list. All chunks in one small bin have exactly the same size, so allocation returns the first chunk without splitting. It will be used if only exact match will be required (small bins don't separate)
+
+			3.3) Large bins (indexes 64 - 127) - stores chunks with sizes larger than 512 bytes. Unlike small bins, each large bin holds chunks of varying sizes within a specific range. Chunks inside large bins are sorted by size in descending order. To optimize search, chunk structure includes additional fields `fd_nextsize` and `bk_nextsize` which link only chunks with different sizes for faster best-fit traversal. If chunk size > requested, it will be separated and remainder will be pushed back to unsorted or large bin.
+			
+		4) Top chunk - large space for allocation if no propertly chunks for allocation. It will be separated and remainder will be returned to top chunk if top chunk's size is more than size required and else curernt top chunk well be free with _int_free() and put to the unsorted bin and new top chunk will be created at the end address of current. And new top chunk will be separated by the same logic 
+		
+		 In conclusion I need to add something about mmaped chunks. If malloc required too range count of bytes which above MMAP_THERSOLD (global variable from glibc) - new free pages will be "linked" to the process. As usual - between glibc's and ld's address space. After free() those paget will be returned to operation system.
+
+So, I think that's all what you need to know at the first steps at binary pwn. 
+Let's observe some cases with exploitation algorythms : 
+
+First of all you should to check common protections with checksec utility. Example of output :
+
+    Arch:       i386-32-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        No PIE (0x8048000)
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+
+	From this dump we can find out main data of binary : 32-bit registers (amd64 if it has 64 bits will be dumped). Partial relro - .got (global variables) & .got.plt (glibc functions) are writeable (are placed at pages with rw- memory protection). No canary found tells about __stck_cnk_fail() not found in binary; it means that we can make stack overflow and don't worry about safety of data between buffer and return address (if canary was found and we need to rewrite return address we'll need find a way to leak this canary and assembly payload with it). NX enabled - stack isn't executable (it's too rare now if stack is executable - the most of programms have this protection). No PIE - Code is position depended - every launch of this binary's base address of binary segments is constant (it won't randomize). Shadow stack & Indirect Branch Tracking as usual don't use even checksec returns that it is. So, firt of them creating new stack at the RAM and saving a pointer to Shadow stack int the Local-Thread Storage, but explaining all of these is beyond the scope of this cheatsheet. 
+	
+	Next you should check blocks of the code which write data to stdout - this is one way to get a leaked address. 
+	If you find a printf without format string like "%s" - program absolute vulnerabale. Let's look at potential vectors of attack :
+	
+		1) Leak all of you need :
+			If we put smth format string prefix like %s / %u / %p and other you'll get a stack data leak. It can be glibc pointers / stack pointers / stack canary / your data and other interesting things. 
+		2) Write what where : 
+			Look at the 3.2 : I tried to write concept of attack properly. So, example of payload can be : 
+			b"%48c%14$hhn%97c%15$hhnaaaaaaaaa\0" + p64(lowest_byte) + p64(lowest_byte + 1)  - that means that we'll write 48 to address from 14th position at the stack and 97 + 48 to address from 15th. Don't forget about padding to place target addresses with default stack alignment (lowest byte's address % 8 == 0). So, in this case "lowest_byte + 1" will have the lowest address of stack (arguments puts from last).
+			
+	Well. Even those tricks can reach you to pwn of a medium task. But if you couldn't find format string vulnerability you can try to find any overflowings like buffer or heap overflow. 
+	
+	If you can control length of input with scanf() / gets() / strcpy() or smth function which control length of read from stdin try to read more bytes than size of buffer ( fgets() / read() / memcpy() ) you can make buffer overflow attack. It means that you can make ROP chain to transfer control to you code. Let's me to explain a couple of technics :
+	
+		1) ret2win - just rewrite return address to "winner" function. As usual it just puts the flag to stdout
+		2) ret2plt - if binary includes functions that we need - system() / execve() / cat() or smth else we can make a ROP-chain with prepares arguments and aligns a stack to properly execution. Our ROP-chains can looks like :
+		pop rdi ; ret
+		"/bin/sh\0"
+		ret
+		system@plt
+		
+		So, RIP will got a pop rdi ; ret address and pop /bin/sh address to rdi - argument to system(). Next, ret takes a value from stack and to system@plt we'll have an aligned address and out process won't be segfalulted on movaps instructions. As a result we'll got a reverse shell
+		
+	Sure you can make more complex instructions like read a string to free writable .data or .bss even or .got sections to put there /bin/sh string (if you haven't it in your binary) before executing.
+	I think it's time to tell a couple of words about partial overwrite. So, if you binary was compiled with PIE (or if you can just make no more than 2 bytes of overwrtite) and you can assume that your target address to read / write / call was included to (0-256) range you'll can rewrite just one the lowest byte of a current address to lowest byte of the your target (and if range is (0-4096) you'll can rewrite 12 lowest bins of a current address). It's pretty simple but can bee to useful if you haven't leak or have it with a restriction.
+	
+		3) ret2libc - if you binary hasn't function what you need and you can leak libc address and calculate base of libc you'll can calculate everything address of function and use every ROP-gadget what you need (pop rax ; ret / pop rsp ; ret and other). So, you can use the absolute address instead of use .plt section.
+		
+		pop rdi ; ret
+		"/bin/sh\0"
+		ret
+		system()
+		
+	And it's time to GOT overwrite explanation : GOT - Global Offset Table of absolute address libc functions for Procedure Linkage Table - after resolving .plt has instrunctions of jmp [GOT-address-of-appropriate-fn]. If Relocation Read-Only is partial - we'll can rewrite one of them to point to another function and call the system() when program calls printf@plt. This attack is based on libc leak and code leak (only if PIE, else we already know addresses of key sections include .plt and .got). So, this technics used when you can't make a ret2smth but when you can use write-what-where with format string (and partial overwrite if it's necessary) and if you think that it's the most successful way.
+	
+	So, that's all at this time. Now you are your own. Good luck :)
