@@ -1,0 +1,88 @@
+=========== HORSE TRACK =============
+
+checksec :
+    Arch:       amd64-64-little
+    RELRO:      Partial RELRO
+    Stack:      Canary found
+    NX:         NX enabled
+    PIE:        No PIE (0x3fc000)
+    RUNPATH:    b'2.33-0ubuntu5_amd64'
+    
+Partial RELRO + No PIE (GOT owerwrite?)
+p.s. libc has partial rr too
+
+malloc + free + system here (heap exploitation?)
+
+======================================
+
+[set_name]
+potential reading of heap data & length control:
+
+  while( true ) {
+    if ((int)length <= counter) {
+      do {
+        input_char = getchar();
+      } while ((char)input_char != '\n');
+      *current_ptr = '\0';
+      return;
+    }
+    input_char = getchar();
+    chr = (char)input_char;
+    while (chr == '\n') {
+      input_char = getchar();
+      chr = (char)input_char;
+    }
+    if (chr == -1) break;            <== HERE (we can fill all name & push Ctrl + D to get EOF = no '\0' and next reading will give us leak)
+    *current_ptr = chr;
+    counter = counter + 1;
+    current_ptr = current_ptr + 1;
+  }
+  return;
+
+========================================
+
+[head_start]
+potential use-after-free in [add horse]
+
+  else {
+    set_name(*(undefined8 *)(buf + (long)(int)index * 0x10),0x10); <== HERE (we can manipulate with freed 8th chunk)
+    printf("New spot? ");
+    __isoc99_scanf(&%d,&spot);
+    *(undefined4 *)(buf + (long)(int)index * 0x10 + 8) = spot;
+    printf("Modified horse in stable index %d\n",(ulong)index);
+  }
+  
+========================================
+
+let's leak the heap base :
+	1) Alloc 1 chunk & free it to put it into the tcache
+	2) Alloc it again and parse mangled ptr to fd (it equals to (current >> 12) ^ next, next == NULL)
+	
+so, if we shift left on 12 bytes we'll get a heap base. It's neseccary to calculate keys to XORing target in the Save-Linking
+
+==========================================
+ 
+ so, we can alloc only 16-256 bytes ==> we can work with only tcache / fastbin / unsorted bin
+ 
+ First of all, let's leak the libc base :
+  1) Alloc 8 chunks per 0x100 bytes
+  2) Free chunk from 1st to 7th (tcache filled fully) and last freed won't concatenated with top chunk
+  3) Free 0th chunk to put it to the unsorted bin
+  4) Alloc 1 more chunk with size < 0x100 (chunk from unsorted will be separated and we get a chunk with main arena addr)
+  5) Put 1 letter to defence zero at start of address
+  6) Get leak during a horse race
+  7) Calculate offset & get libc base
+
+==========================================
+
+Finally, we got all leaks what we needed. Now do Use-After-Free to rewrite fd address [ tcache poinsoning ]:
+	1) Create chunk with '/bin/sh\x00'
+	2) Check where is last freed chunk
+	3) With [head start] uaf to rewrite fd address to Save-Linked [ free@got.plt & ~0xf ]
+	(Because free@got.plt situated at 0x404018 but malloc address must be aligned of 0x10. We'll just put a padding as b'a' * 8 to reach target address)
+
+So, alloc one chunk to get target address in the tcache & next malloc will returns 0x404010
+Now our payload is : b'a' * 8 + p64(system)[:-1] + eof (if we put whole system address, zero-terminator will rewrite 1st byte of putc@got.plt --> segfault. Gratest byte if libc address doesn't matter (it's always equals 0))
+
+And now, let's trigger rewritten free@got.plt to system with our prepared '/bin/sh\x00' chunk
+Congratulations! We got reverse shell.
