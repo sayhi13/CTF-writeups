@@ -1,8 +1,8 @@
 NIGHTMARE CHEATSHEET
 
 I advise you to read it if you already have anything knowledge about PWN... but you can find out something new what will be interesting to learn
-At the down of this article you can find anyone contretic exploitation cases including which I was faced 
-And sorry about my not properly English :)
+At the down of this article you can find anyone contretic exploitation cases including which I was faced
+Sorry for my not properly English :)
 
 # 1. Basics
 
@@ -151,7 +151,7 @@ And sorry about my not properly English :)
 
 		Also tcache & fastbin are cyclic-one-side list, so only fd pointer used to. However, tcache have a special key which putting after free() if freed chunk pushed into tcache
 		
-	## 3.2 Pools and bins for freed chunks
+	## 3.2 Pools and bins for freed chunks :
 		1) tcache - fast cache for fast push/pop chunks. LIFO. Includes 64 dword wirtings about count of chunks in the bins & 64 entries field aka next free chunk
 		
 		pseudostructure of tps:
@@ -167,7 +167,54 @@ And sorry about my not properly English :)
 		
 		P.s forward pointer points to 2nd qword of chunk (always 2nd - 3rd qwords - allocator's data) but upper chunk has "header" which includes PREV_SIZE & SIZE fields.
 		
-		2) fastbin - also quick pool to push/pop chunks, but chunk are going here if only appropriate bin int the tcache already fulled. Range of sizes which can be pushed to fastbin : [0x10 - 0x80]. Also LIFO - cyclic-one-binded list. Also has save-linking but hasn't key. Potentially struct for double free (fustbin_dup vulnerability - we'll look at this later)
+		2) fastbin - also quick pool to push/pop chunks, but chunk are going here if only appropriate bin int the tcache already fulled. Range of sizes which can be pushed to fastbin : [0x10 - 0x80]. Also LIFO - cyclic-one-binded list. Also has save-linking but hasn't key. Potentially struct for double free (fastbin_dup vulnerability) - fastbin doesn't make strict chechings unlike tcache and just compare last freed chunk with required to free chunk. If they equal => !faststop. Else ok. So, we can allocate 7 chunks, free() 7 from they to full filling tcache and allocate 3 more chunks A, B and C (for C separate B from top chunk concatenation [read 4 point]).
+		Then free(A), free(B) to pass !faststop and free(A) again. Let see step by step
+		
+		1. free(A) :
+			A -> NULL
+		2. free(B) :
+			B -> A -> NULL
+		3. free(A) :
+			A -> B -> A -> B -> ... -> A -> B -> ...
+			
+			We'll got a cyclic list because in memory we have only 2 chunks but try to "free 3 chunks". And physically A will points to B after second free()
+			So, when we allocate an A chunk we can rewrite 'fd' pointer (don't forget about save-linking) A will point to rewritten address 
+			
+			B -> A -> Write-What-Where address
+			
+			And after B and A allocation next address will points to any address which we rewritten
+			Final step - call one more malloc to allocate chunk in arbitrary memory
+			
+			A little comment : 
+				Since glibc_2.41 to reach fastbin chunks we must to move them to tcache. So, after double free in fastbin_dup we must free tcache (just malloc freed first 7 chunks again) and allocator will move our double freed chunks to the tcache after next allocation
+			
+		Example from how2heap (croped):
+		
+			 14     for (int i=0; i<7; i++) {
+			 15         ptrs[i] = malloc(8);
+			 16     }
+			 17 
+			 19     int *a = malloc(8);
+			 20     int *b = malloc(8);
+			 21     int *c = malloc(8);
+			 25 
+			 27     for (int i=0; i<7; i++) {
+			 28         free(ptrs[i]);
+			 29     }
+			 30 
+			 32     free(a);
+			 38     free(b);
+			 42     free(a);
+			 44 
+			 48     for (int i = 0; i < 7; i++) {
+			 49         ptrs[i] = malloc(8);
+			 50     }
+			 51 
+			 54     a = malloc(8);
+			 55     b = malloc(8);
+			 56     c = malloc(8);
+			 
+			 'a' will equals 'c' and if we would write save-linked address to 'a', next allocation returns chunk at rewritten address
 		
 		3) Main arena bins :
 			3.1) Unsorted bin (index == 1) - this place is FIFO cyclic-two-binded list. If chunk with appropriate size already doesn't fit to tcahce bin & fastbin (or it's size above than 0x80 bytes) it was pushed to Unsoted bin or absolutely equalification in the tcache & fastbin not found, so we go to the check : if unsorted / small / large bins include chunks which size of chunk more than user required ==> chunk will be separated and chunk with required size will be returned to user and remainder will be pushed to unsorted bin. Last freed chunk will be put between head and last freed chunk.
@@ -176,9 +223,126 @@ And sorry about my not properly English :)
 
 			3.3) Large bins (indexes 64 - 127) - stores chunks with sizes larger than 512 bytes. Unlike small bins, each large bin holds chunks of varying sizes within a specific range. Chunks inside large bins are sorted by size in descending order. To optimize search, chunk structure includes additional fields `fd_nextsize` and `bk_nextsize` which link only chunks with different sizes for faster best-fit traversal. If chunk size > requested, it will be separated and remainder will be pushed back to unsorted or large bin.
 			
-		4) Top chunk - large space for allocation if no propertly chunks for allocation. It will be separated and remainder will be returned to top chunk if top chunk's size is more than size required and else curernt top chunk well be free with _int_free() and put to the unsorted bin and new top chunk will be created at the end address of current. And new top chunk will be separated by the same logic 
+		4) Top chunk - large space for allocation if no properly chunks for allocation. It will be separated and remainder will be returned to top chunk if top chunk's size is more than size required and else curernt top chunk well be free with _int_free() and put to the unsorted bin and new top chunk will be created at the end address of current. And new top chunk will be separated by the same logic. If freed chunk is neighbour of top chunk they will be concatenated (chunk won't be put to bins or tcache)
 		
-		 In conclusion I need to add something about mmaped chunks. If malloc required too range count of bytes which above MMAP_THERSOLD (global variable from glibc) - new free pages will be "linked" to the process. As usual - between glibc's and ld's address space. After free() those paget will be returned to operation system.
+		 In conclusion I need to add something about mmaped chunks. If malloc required too range count of bytes which above MMAP_THERSOLD (global variable from glibc) - new free pages will be "linked" to the process. As usual - between glibc's and ld's address space. After free() those pages will be returned to operation system.
+		 
+	#3.3 House of Orange :
+		If you have writing primitive (boverflow or arbitrary write) in the heap and you need to leak libc address or heap address and code hasn't free() you can use exploitation technic like House of Orange to trigger _int_free() and put top-chunk into the unsorted bin. You also need reading primitive to get a leak of address.
+		
+		If during malloc() we can't find chunk with required size and unsorted bin is empty we'll try to separate top chunk (separated part will be return and remainder of top chunck will move to the "top")
+		But if size of top chunk less than size of required chunk (and size of required chunk less than MMAP_THERSOLD) it will be freed with _int_free() and put into unsorted bin and heap will load new pages to place new large top chunk here
+		New size of top chunk must be aligned by 0x1000 bytes (with current flags condition). It means that the last qword of our modificated top chunk must have address 0x1000 - 0x8. All of theese for pass an error when new pages will be loaded (page address must be aligned by 0x1000 bytes)
+		So, we just have to read address of main arena bins via our reading primitive. It will situate at +0x0 and +0x8 offset from content of the freed chunk
+		And the interesting moment : when we use _int_free() via House of Orange, at the last qword of allocated chunk (after next malloc with properly address [no absolute equals to tcache chunks and fastbin chunks]) we'll have a heap address which points to header of this chunk and next allocations will return chunks and their last qword will points also to their header
+		It means that we can leak libc address if we have a way to do this (maybe process doesn't overwrite main arena addresses and we can get leak with valid reading of content) and we can leak heap address after valid malloc via reading whole content (including last qword) of chunk
+		
+		Example : 
+		
+		0x55f68ab79290: 0x0000000000000000      0x0000000000000021	<- here we allocated evil chunk with boverflow
+		0x55f68ab792a0: 0x0000000000000010      0x0000000000000001	<- valid chunk data
+		0x55f68ab792b0: 0x6161616161616161      0x0000000000000d31	<- user-control field (overwrite size of top chunk) and next qword is SIZE with PREV_INUSE = 1 (then address will be less than this)
+		0x55f68ab792c0: 0x00007fc371619ce0      0x00007fc371619ce0	<- after malloc with required size more than 0xd30 top chunk will be freed and put to 'fd' & 'bk' pointer to main arena bin
+		
+		0x55f68ab79290: 0x0000000000000000      0x0000000000000021	
+		0x55f68ab792a0: 0x0000000000000010      0x0000000000000001
+		0x55f68ab792b0: 0x6161616161616161      0x0000000000000021	<- allocated chunk from unsorted bin via freed top chunk separation
+		0x55f68ab792c0: 0x0000000000000010      0x0000000000000001	<- valid chunk data (if code wouldn't have self-chunk modifying we would have addresses of main arena)
+		0x55f68ab792d0: 0x000055f68ab792b0      0x0000000000000d11	<- here! last qword of allocated chunk points to 0x000055f68ab792b0 (header of allocated chunk) [because data of chunk can rewrite PREV_SIZE of nxt chunk]
+		0x55f68ab792e0: 0x00007fc371619ce0      0x00007fc371619ce0	<- remainder after separation was put into unsorted bin again
+		 
+#4 Bonus :
+	#4.1 Off-By-One :
+		Sometimes program doesn't check condition when we are writing of index which equals length of buffer. It means that we can rewrite one chunk after buffer.
+		It can includes max available values or metadata of chunk header. If we rewrite it we'll can get a control of critical structures to get an access for something.
+		
+	#4.2 PLT-Trampoline :
+		If we have not small primitive of writing to the .got section of our binary we can make so powerful attack. All of we need - ".got grooming" before exploitation.
+		But before this let me tell you about a couple of technical things :
+			1) The beginning of .got section includes very important addresses for lazy-bound : with + 0x8 offset linkage map and with + 0x10 offset address of resolver 
+			2) After .got overwrite we can rewrite RIP as we want including part of .plt section which calls resolver (beginning of .plt) and we'll call these instead of valid glibc function :
+			
+			0000000000001020 <.plt>:
+			    1020:       ff 35 72 2f 00 00       push   QWORD PTR [rip+0x2f72]        # 3f98 <_GLOBAL_OFFSET_TABLE_+0x8>
+			    1026:       f2 ff 25 73 2f 00 00    bnd jmp QWORD PTR [rip+0x2f73]        # 3fa0 <_GLOBAL_OFFSET_TABLE_+0x10>
+			    
+		So, after rewriting of _GLOBAL_OFFSET_TABLE_+0x8 and _GLOBAL_OFFSET_TABLE_+0x10 we can take full control of executing of program - we just put address of argument to the stack and call function what we need.
+		I can even show real case for u :
+		
+			0000000000045be0 <setcontext@@GLIBC_2.2.5>:
+			   45be0:       57                      push   rdi
+			   45be1:       48 8d b7 28 01 00 00    lea    rsi,[rdi+0x128]
+			   45be8:       31 d2                   xor    edx,edx
+			   45bea:       bf 02 00 00 00          mov    edi,0x2
+			   45bef:       41 ba 08 00 00 00       mov    r10d,0x8
+			   45bf5:       b8 0e 00 00 00          mov    eax,0xe
+			   45bfa:       0f 05                   syscall
+			   45bfc:       5a                      pop    rdx
+			   45bfd:       48 3d 01 f0 ff ff       cmp    rax,0xfffffffffffff001
+			   45c03:       73 5b                   jae    45c60 <setcontext@@GLIBC_2.2.5+0x80>
+			   45c05:       48 8b 8a e0 00 00 00    mov    rcx,QWORD PTR [rdx+0xe0]
+			   45c0c:       d9 21                   fldenv [rcx]
+			   45c0e:       0f ae 92 c0 01 00 00    ldmxcsr DWORD PTR [rdx+0x1c0]
+			   45c15:       48 8b a2 a0 00 00 00    mov    rsp,QWORD PTR [rdx+0xa0]
+			   45c1c:       48 8b 9a 80 00 00 00    mov    rbx,QWORD PTR [rdx+0x80]
+			   45c23:       48 8b 6a 78             mov    rbp,QWORD PTR [rdx+0x78]
+			   45c27:       4c 8b 62 48             mov    r12,QWORD PTR [rdx+0x48]
+			   45c2b:       4c 8b 6a 50             mov    r13,QWORD PTR [rdx+0x50]
+			   45c2f:       4c 8b 72 58             mov    r14,QWORD PTR [rdx+0x58]
+			   45c33:       4c 8b 7a 60             mov    r15,QWORD PTR [rdx+0x60]
+			   45c37:       48 8b 8a a8 00 00 00    mov    rcx,QWORD PTR [rdx+0xa8]
+			   45c3e:       51                      push   rcx
+			   45c3f:       48 8b 72 70             mov    rsi,QWORD PTR [rdx+0x70]
+			   45c43:       48 8b 7a 68             mov    rdi,QWORD PTR [rdx+0x68]
+			   45c47:       48 8b 8a 98 00 00 00    mov    rcx,QWORD PTR [rdx+0x98]
+			   45c4e:       4c 8b 42 28             mov    r8,QWORD PTR [rdx+0x28]
+			   45c52:       4c 8b 4a 30             mov    r9,QWORD PTR [rdx+0x30]
+			   45c56:       48 8b 92 88 00 00 00    mov    rdx,QWORD PTR [rdx+0x88]
+			   45c5d:       31 c0                   xor    eax,eax
+			   45c5f:       c3                      ret
+			   
+		We can just prepare a setcontect struct (ucontext_t as I remember) somewhere in memory and put it's address to _GLOBAL_OFFSET_TABLE_+0x8 and put address of setcontext + 32 to _GLOBAL_OFFSET_TABLE_+0x10
+		It resets all registres including rsp and basically can gives reverse shell if we place in rdi "/bin/sh\0" and place RIP on system() with aligned RSP, because we control it too. Or just make execve with stack pivoting.
+		Your border is you imagination here ;)
+		
+	#4.3 One gadget :
+		If we have only 1 qword (or dword if we are working with 32-bits) to overflow and you have a libc leak we can use one-gadget technic.
+		It means that we'll call a part of libc code which calls execve("bin/sh\0", arg1, arg2) where arg1 = rsi and arg2 = rdx.
+		But you should be sure that rsi and rdx are valid addresses or NULL. Just two rules. execve() make something like "lazy reading" - it will look at the arguments when it's necessary and all of these are couse that we can just put an address from address space of our process (with flag for reading) and start execve(). But the best way to do this - get a NULL in argv & envp. [True definition of valid argv / envp is array with pointers to strings with "arguments" which ends by NULL pointer]
+		So, output of one_gadget utility on ruby looks like :
+		
+		$ /home/sayhi/.local/share/gem/ruby/3.3.0/bin/one_gadget /usr/lib/x86_64-linux-gnu/libc.so.6
+		
+		0xde6c3 execve("/bin/sh", rbp-0x40, r13)
+		constraints:
+		  address rbp-0x38 is writable
+		  rdi == NULL || {"/bin/sh", rdi, NULL} is a valid argv
+		  [r13] == NULL || r13 == NULL || r13 is a valid envp
+		  
+		rbp-0x40 and r13 means that rsi and rdx will be get from them
+		It means that with address <libc_base> + 0xde6c3 we have an one gadget. Let's check an objdump :
+		
+		[one gadget part]
+		de6c3:       4c 8d 35 72 97 0c 00    lea    r14,[rip+0xc9772]        # 1a7e3c <_libc_intl_domainname@@GLIBC_2.2.5+0x20e>
+		de6ca:       48 89 7d c8             mov    QWORD PTR [rbp-0x38],rdi
+		de6ce:       4c 8d 65 c0             lea    r12,[rbp-0x40]
+		de6d2:       4c 89 75 c0             mov    QWORD PTR [rbp-0x40],r14
+		de6d6:       eb 83                   jmp    de65b <execvp@@GLIBC_2.2.5+0xab>
+		
+		[execvp part]
+		00000000000de5b0 <execvp@@GLIBC_2.2.5>:
+		de5b0:       48 8b 05 01 6a 13 00    mov    rax,QWORD PTR [rip+0x136a01]        # 214fb8 <__environ@@GLIBC_2.2.5-0x7e70>
+		de5b7:       48 8b 10                mov    rdx,QWORD PTR [rax]
+		de5ba:       e9 61 04 00 00          jmp    dea20 <execvpe@@GLIBC_2.11>
+		...
+		de8d6:       48 8b 7d a8             mov    rdi,QWORD PTR [rbp-0x58]
+		de8da:       4c 89 ea                mov    rdx,r13
+		de8dd:       4c 89 e6                mov    rsi,r12
+		de8e0:       4c 89 45 90             mov    QWORD PTR [rbp-0x70],r8
+		de8e4:       e8 67 fc ff ff          call   de550 <execve@@GLIBC_2.2.5>
+		
+		Finally we'll call execve().
+		p.s you can use already known technics like stack pivoting to control RSP/RBP or use a program logic to groom our "furure arguments" (if it's possible of cource) if you haven't NULL pointers.
 
 So, I think that's all what you need to know at the first steps at binary pwn. 
 Let's observe some cases with exploitation algorythms : 
@@ -194,7 +358,7 @@ First of all you should to check common protections with checksec utility. Examp
     IBT:        Enabled
     Stripped:   No
 
-	From this dump we can find out main data of binary : 32-bit registers (amd64 if it has 64 bits will be dumped). Partial relro - .got (global variables) & .got.plt (glibc functions) are writeable (are placed at pages with rw- memory protection). No canary found tells about __stck_cnk_fail() not found in binary; it means that we can make stack overflow and don't worry about safety of data between buffer and return address (if canary was found and we need to rewrite return address we'll need find a way to leak this canary and assembly payload with it). NX enabled - stack isn't executable (it's too rare now if stack is executable - the most of programms have this protection). No PIE - Code is position depended - every launch of this binary's base address of binary segments is constant (it won't randomize). Shadow stack & Indirect Branch Tracking as usual don't use even checksec returns that it is. So, firt of them creating new stack at the RAM and saving a pointer to Shadow stack int the Local-Thread Storage, but explaining all of these is beyond the scope of this cheatsheet. 
+	From this dump we can find out main data of binary : 32-bit registers (amd64 if it has 64 bits will be dumped). Partial relro - .got (global variables) & .got.plt (glibc functions) are writeable (are placed at pages with rw- memory protection). No canary found tells about __stck_cnk_fail() not found in binary; it means that we can make stack overflow and don't worry about safety of data between buffer and return address (if canary was found and we need to rewrite return address we'll need find a way to leak this canary and assembly payload with it or find arbitrary write to scoping rewriting). NX enabled - stack isn't executable (it's too rare now if stack is executable - the most of programms have this protection). No PIE - Code is position depended - every launch of this binary's base address of binary segments is constant (it won't randomize). Shadow stack & Indirect Branch Tracking as usual don't use even checksec returns that it is. So, first of them creating new stack at the RAM and saving a pointer to Shadow stack int the Local-Thread Storage, but explaining all of these is beyond the scope of this cheatsheet. 
 	
 	Next you should check blocks of the code which write data to stdout - this is one way to get a leaked address. 
 	If you find a printf without format string like "%s" - program absolute vulnerabale. Let's look at potential vectors of attack :
