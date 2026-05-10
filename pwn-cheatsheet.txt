@@ -1,4 +1,4 @@
-NIGHTMARE CHEATSHEET
+NIGHTMARE CHEATSHEET by s4yHi
 
 I advise you to read it if you already have anything knowledge about PWN... but you can find out something new what will be interesting to learn
 At the down of this article you can find anyone contretic exploitation cases including which I was faced
@@ -343,6 +343,101 @@ Sorry for my not properly English :)
 		
 		Finally we'll call execve().
 		p.s you can use already known technics like stack pivoting to control RSP/RBP or use a program logic to groom our "furure arguments" (if it's possible of cource) if you haven't NULL pointers.
+		
+	#4.4 __libc_csu_init exploitation aka ret2csu :
+		Every GCC's binary (without -nostdlib compiling flag) has __libc_csu_init function, so this initialize libc, libc's structures, __frame_dummy_init_array_entry, __do_global_dtors_aux_fini_array_entry and other. 
+		If you haven't PIE or found a way to leak code address you can make ret2csu technic (you can use it to call read() / write() / open() and other)
+		
+		Let's look at the disasm :
+		
+			0000000000400ba0 <__libc_csu_init>:
+			  400ba0:       41 57                   push   r15
+			  400ba2:       41 56                   push   r14
+			  400ba4:       49 89 d7                mov    r15,rdx
+			  400ba7:       41 55                   push   r13
+			  400ba9:       41 54                   push   r12
+			  400bab:       4c 8d 25 be 11 20 00    lea    r12,[rip+0x2011be]        # 601d70 <__frame_dummy_init_array_entry>
+			  400bb2:       55                      push   rbp
+			  400bb3:       48 8d 2d be 11 20 00    lea    rbp,[rip+0x2011be]        # 601d78 <__do_global_dtors_aux_fini_array_entry>
+			  400bba:       53                      push   rbx
+			  400bbb:       41 89 fd                mov    r13d,edi
+			  400bbe:       49 89 f6                mov    r14,rsi
+			  400bc1:       4c 29 e5                sub    rbp,r12
+			  400bc4:       48 83 ec 08             sub    rsp,0x8
+			  400bc8:       48 c1 fd 03             sar    rbp,0x3
+			  400bcc:       e8 17 fb ff ff          call   4006e8 <_init>
+			  400bd1:       48 85 ed                test   rbp,rbp
+			  400bd4:       74 20                   je     400bf6 <__libc_csu_init+0x56>
+			  400bd6:       31 db                   xor    ebx,ebx
+			  400bd8:       0f 1f 84 00 00 00 00    nop    DWORD PTR [rax+rax*1+0x0]
+			  400bdf:       00 
+			  400be0:       4c 89 fa                mov    rdx,r15
+			  400be3:       4c 89 f6                mov    rsi,r14
+			  400be6:       44 89 ef                mov    edi,r13d
+			  400be9:       41 ff 14 dc             call   QWORD PTR [r12+rbx*8]
+			  400bed:       48 83 c3 01             add    rbx,0x1
+			  400bf1:       48 39 dd                cmp    rbp,rbx
+			  400bf4:       75 ea                   jne    400be0 <__libc_csu_init+0x40>
+			  400bf6:       48 83 c4 08             add    rsp,0x8
+			  400bfa:       5b                      pop    rbx
+			  400bfb:       5d                      pop    rbp
+			  400bfc:       41 5c                   pop    r12
+			  400bfe:       41 5d                   pop    r13
+			  400c00:       41 5e                   pop    r14
+			  400c02:       41 5f                   pop    r15
+			  400c04:       c3                      ret
+			  400c05:       90                      nop
+			  400c06:       66 2e 0f 1f 84 00 00    cs nop WORD PTR [rax+rax*1+0x0]
+			  400c0d:       00 00 00 
+			  
+		Parts 0x400bfa - 0x400c04 and 0x400be0 - 0x400be9 look interesting, so try to find a way how you can exploit it untill you read down
+		
+		This will be actually the most elegant way to assembly a ROP chain unless you have in binary gadgets like 
+		
+		p	pop rdi ; ret
+			pop rsi ; ret
+			pop rdx ; ret
+		
+		(or you can't get a libc leak yet) and if you have a writing primitive to 9-10 gadgets (buffer overflow or arbitrary write or stack pivot) if you want to just complete a one function or 16-20 gadgets if you want to continue ROP (stack pivot is good way or large writing primitive if you have it):
+				
+		We can separate this function to 2 parts : 
+		
+			  400bfa:       5b                      pop    rbx
+			  400bfb:       5d                      pop    rbp
+			  400bfc:       41 5c                   pop    r12
+			  400bfe:       41 5d                   pop    r13
+			  400c00:       41 5e                   pop    r14
+			  400c02:       41 5f                   pop    r15
+			  400c04:       c3                      ret
+			  
+			  Preparing r15, r14, r13d to move them to rdx, rsi, edi and preparing r12 & rbx to get an address of address which points to the part of code (double pointer because call waits address), so you can put to rbx address of .got divided with 8 and r12 = 0. It works, because address of .got section points (and it's address % 8 == 0) to an address from libc (and rbx will be multiple with 8)
+			  
+			400be0:       4c 89 fa                mov    rdx,r15
+			400be3:       4c 89 f6                mov    rsi,r14
+			400be6:       44 89 ef                mov    edi,r13d
+			400be9:       41 ff 14 dc             call   QWORD PTR [r12+rbx*8]
+			
+			So, after returning to this part from the previous part we'll transfer control with arguments which we want. But look at the part after called function rerturns :
+			
+			  400bed:       48 83 c3 01             add    rbx,0x1
+			  400bf1:       48 39 dd                cmp    rbp,rbx
+			  400bf4:       75 ea                   jne    400be0 <__libc_csu_init+0x40>
+			  400bf6:       48 83 c4 08             add    rsp,0x8
+			  
+			  Okay, we'll just increment of rdx and compare it with base pointer. They must equal if we plan to continue ROP. But after this we need consider a stack statement because rbx, ..., r15 will be pop again (so, we can use several ret2csu technics in the one ROP)
+			
+		Payload may looks like :
+		
+			1. 0x400bfa			( first part of __libc_csu_init )
+			3. target_address / 8 + 1
+			2. target_address / 8		( rbx )
+			3. 0				( r12 is zero because rbx * 8 already points properly)
+			4. 1st arg			[dword] (r13d -> edi)
+			5. 2nd arg			[qword] (r14 -> rsi)
+			6. 3rd arg			[qword] (r15 -> rdx)
+			7. 0x400be0			( second part of __libc_csu_init )
+			
+			8, 9, ... gadgets may be args to next call of another function via __libc_csu_init or just be a continued of the ROP
 
 So, I think that's all what you need to know at the first steps at binary pwn. 
 Let's observe some cases with exploitation algorythms : 
