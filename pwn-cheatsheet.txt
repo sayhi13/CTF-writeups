@@ -394,7 +394,7 @@ Sorry for my not properly English :)
 		
 		This will be actually the most elegant way to assembly a ROP chain unless you have in binary gadgets like 
 		
-		p	pop rdi ; ret
+			pop rdi ; ret
 			pop rsi ; ret
 			pop rdx ; ret
 		
