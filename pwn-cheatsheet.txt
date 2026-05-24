@@ -201,6 +201,10 @@ And I should mention the stack-red-zone (128 bytes under $rsp) - this place is
 used by kernel signals and it uses this space for their metadata (after a signal,
 data at the stack can be corrupted).
 
+Don't forget about 'leave' instruction ( expand to : mov rsp, rbp ; pop rbp ). 
+It can will be useful if you detected address at the $rbp which you need. 
+For example - main-looping of a prog (when you call main or _start twice or more
+via .fini_array overwrite (look bonus 5.6) 
 
 2.5 Sigreturn Oriented Programming (SROP)
 ------------------------------------------------------------------------------
@@ -282,8 +286,14 @@ It has 3 variants:
 Example: you leaked the stack address and calculated the target. So, you can
 assembly payloads like this:
 
-    "%'a'c%'k'$hhn" + "%'b - a'c%'k'$hhn" + ... + <address of 1st byte>
-    + <address of 2nd byte> + ... + <address of n-th byte>
+    "%'a'c%'k'$hhn" + <address of 1st byte>
+    But you can't combine several position depended %hhn, because when compiler is seeing '$' specificator, 
+    printf transfers control to position_printf (buf count of '$' depends from current OS and build)
+    [ I'll give more info in next commits ]
+    which looks at the all format-string specificator 
+    which creates his own stack and put all of arguments from original printf args. 
+    So, it means that you can do one address rewrite during such format-string arbitrary-write attack
+    To rewrite more than one 1 or 2 bytes you should find a way to call printf twice or more times
 
 %ac puts 'a' chars (0x20 as usual) and %k$hhn puts 'a' to the k-th address on
 the stack. First of all you need to check which position your buffer has on the
@@ -292,7 +302,6 @@ And you should read what your own format string includes. To find the correct "k
 Don't forget to make a subtraction of the second and other %bc (b = your value - a),
 because %n writes the length of only printable characters - it's passing format
 strings. And after first writing the "counter" adds 'a' to itself.
-
 
 ================================================================================
 4. HEAP EXPLOITATION
@@ -813,6 +822,87 @@ In conclusion I must tell you that our deal is always guessing, discovering
 and hope that we'll find a way to pwn it. But of course, without brilliant
 technical knowledge this point is unreachable.
 
+5.6 .init_array / .fini_array overwrite
+------------------------------------------------------------------------------
+
+When your process was deployed, first of all code _start (or another entry tag) was called
+It provides arguments such as main address, init wrapper and fini wrapper to initializator
+Next, _start calls __libc_csu_init with those arguments and init wrapper was called as beginning
+after libc and other initialization it calls main and after main returning it calls 
+fini wrapper. 
+Of cource these wrappers need arguments like special structures as .init/.fini_array
+which include addresses of especially resolvers' codes and situate at the .data/.bss sections as usual
+So, if you have arbitrary write primitive with Partial RelRO and no PIE or you know addresses
+you'll can overwrite those structs
+It means that you can take a control of beginning/ending of a program (ending as usual)
+via overwriting resolvers' addresses and after main code goes to your instructions instead of ends
+
+Look at this : 
+
+	void processEntry entry(undefined8 param_1,undefined8 param_2) {
+	  undefined1 auStack_8 [8];
+	  FUN_00401eb0(main,param_2,&stack0x00000008,FUN_004028d0,FUN_00402960,param_1,auStack_8);
+	  while( true );
+	}
+
+FUN_004028d0 - init wrapper
+FUN_00402960 - fini wrapper
+
+Now find structs : 
+
+	readelf -a ./prog | grep -E ".init_array|.fini_array"
+	  [15] .init_array       INIT_ARRAY       00000000004b40e0  000b30e0		<== addresses at the rw-
+	  [16] .fini_array       FINI_ARRAY       00000000004b40f0  000b30f0		    section (.data or .bss)
+	  
+0x00000000004b40f0 is an address of .fini_array. Let's check it in gdb : 
+
+	gef➤  x/2gx 0x0000000004b40f0
+	0x4b40f0:       0x0000000000401b00      0x0000000000401580
+	
+Well, these are addresses of fini resolvers. Let me explain you what are mean :
+
+	0x4b40f0 + 0x0 ==> 0x0000000000401b00 - addres of _do_global_dtors_aux which destructs
+						global objects like structs and another obj
+						which not destructed to ending of a prog.
+						It was called after 0x0000000000401580
+						
+	0x4b40f0 + 0x8 ==> 0x0000000000401580 - address of __libc_csu_fini which finalize our main
+						and another prog resourses. It triggers all of finalizators 
+						and destructors including _do_global_dtors_aux
+						via basically calls or rets
+						
+	But content of these addresses still depends by linker. I advise you to check it anyway
+	So, after execution of [ 0x4b40f0 + 0x8 ] control transfers to [ 0x4b40f0 + 0x0 ].
+	
+All of what are we need - overwrite one of these to get a one more "cycle" via [ 0x4b40f0 + 0x8 ]
+or both of them ( _do_global_dtors_aux + __libc_csu_fini ) to make one "cycle" + one block of code 
+or endless "cycle" of main. Let's look at the last way :
+
+	If FUN_00402960 (which address is 0x402960) is fini wrapper just put it instead of _do_global_dtors_aux
+	at [ 0x4b40f0 + 0x0 ]
+	And address of main instead of __libc_csu_fini at [ 0x4b40f0 + 0x8 ]
+
+	gef➤  x/2gx 0x0000000004b40f0
+	0x4b40f0:       0x0000000000402960      0x0000000000401b6d
+						
+	Finally, after main we go to [ 0x4b40f0 + 0x8 ] to execute it's code == go to main again
+	And after main's returning we'll go to [ 0x4b40f0 + 0x0 ] - to the fini wrapper 
+	instead of _do_global_dtors_aux
+	Next, fini wrapper will looks at the [ .fini_array + 0x8 ] == [ 0x4b40f0 + 0x8 ] and will see 0x401b6d 
+	It think that it's a resolver address and calls it - calls main!
+	And after main's ending we'll go again to [ 0x4b40f0 + 0x0 ]. I think you got it ;)
+	
+	p.s. if you have went here after ROP part - let me to tell you a couple of word about 'leave'
+	In my case : 
+	after cycles of the main $rbp became was equal to .fini_array's address and let me to used
+	'leave' to pivot stack to .fini_array + 0x8 address (rsp -> .fini_array ; pop rbp took one qword 
+	from a top of stack and rsp + 0x8) where with +0x8 offset from $rsp (+0x10 from .fini_array)
+	I already had a groomed "stack frame" with a ROP chain
+	
+	If you interested I had two ways (my payload began at .fini_array + 0x10) : 
+		1) rewrite [ .fini_array + 0x8 ] to "ret" gadget and go to ROP chain immediately
+		2) don't do this and pass one more main calling to after main's "ret" 
+		go to [ .fini_array + 0x10 ] ROP
 
 ================================================================================
 6. EXPLOITATION CASES: STEP-BY-STEP
