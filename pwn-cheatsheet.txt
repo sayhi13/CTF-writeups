@@ -197,7 +197,7 @@ Example of a ROP-chain for stack-pivoting:
     -> pop rdi ; ret -> </bin/sh address> -> pop rsi ; ret -> <0 or args>
     -> pop rdx ; ret -> <0 or environ> -> syscall <=> We got a shell
 
-And I should mention the stack-red-zone (128 bytes under $rsp) - this place is
+And I should mention the stack-red-zone (128 bytes unpper $rsp) - this place is
 used by kernel signals and it uses this space for their metadata (after a signal,
 data at the stack can be corrupted).
 
@@ -685,6 +685,8 @@ P.S. You can use already known techniques like stack pivoting to control RSP/RBP
 or use program logic to groom our "future arguments" (if it's possible of course)
 if you haven't NULL pointers.
 
+P.s you probably will be faced with another "rules" of the one gadget
+For example - $esi must points to libc.got.plt section and other
 
 5.4 __libc_csu_init Exploitation aka ret2csu
 ------------------------------------------------------------------------------
@@ -810,7 +812,7 @@ Payload may look like:
 5.5 Anyway Check What Stack / Heap / .data & .bss Includes
 ------------------------------------------------------------------------------
 
-When I was solving a task from pwnable (deaslr 500) I faced a large writing
+When I was solving a task from pwnable.tw (deaslr 500) I faced a large writing
 primitive and no way to leak any address.
 So, I just needed to look at the stack and find an ld.so gadget which
 calculated an address based on the content in $rbx and an offset in $r15.
@@ -818,6 +820,21 @@ When you are solving the same tasks - without leaks, gadgets like these and
 arithmetics are your best friends.
 You have to try to find something which the address space of your process
 already includes.
+
+If you are thinking that potentially way to pwn it is wrong, first of all
+be sure that it is. Just check objdump and analyze it : "Why it's wrong?"
+For example, when I solved "dubblesort" from also pwnable I thought that
+system('/bin/sh') couldn't be called properly, because payload must have 
+specific format - I couldn't just put [pop ebx ; ret -> '/bin/sh' -> system]
+But system() already took an argument from the stack and it argument must 
+be place under the address of system()... So, I tried to use one_gadget,
+make a ret2main, leak canary to build context, leak ld to find correct
+gadget instead just buid payload from 2 parts with that knowledge...
+So, before discard the variant I advise you to make sure "at the lowest level"
+that you a right... Or not ;)
+And if you have two variants — try the simpler one first on remote, 
+because environment differences can kill an elegant local exploit
+
 In conclusion I must tell you that our deal is always guessing, discovering
 and hope that we'll find a way to pwn it. But of course, without brilliant
 technical knowledge this point is unreachable.
