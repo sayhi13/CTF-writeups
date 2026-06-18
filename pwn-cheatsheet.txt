@@ -697,7 +697,7 @@ __frame_dummy_init_array_entry, __do_global_dtors_aux_fini_array_entry
 and others.
 
 If you haven't PIE or found a way to leak the code address you can use the
-ret2csu technique (you can use it to call read()/write()/open() and others).
+ret2csu technique (you can use it to call read()/write()/open() and others in .plt).
 
 Let's look at the disasm:
 
@@ -920,6 +920,53 @@ or endless "cycle" of main. Let's look at the last way :
 		1) rewrite [ .fini_array + 0x8 ] to "ret" gadget and go to ROP chain immediately
 		2) don't do this and pass one more main calling to after main's "ret" 
 		go to [ .fini_array + 0x10 ] ROP
+		
+5.7 Arguments control via $EBP/$RBP
+------------------------------------------------------------------------------
+
+In such cases when you have "partial" or full arbitrary write primitive & you have a stack leak
+You can make the $EBP/$RBP control attack. I hope you understand stack-frame layout.
+Any arguments and local variables depends on stack pointer address. So, your binary via "lea" 
+with offset from stack pointer calculates addresses of local variables and uses it in the code.
+So, if you have a way to overwrite this pointer to prepared memory space you'll can control 
+function with it's arguments.
+
+Let's look at an example :
+
+	void handler(void) {
+	  int selected_opt;
+	  char input [22];
+
+	  do {
+	    printf("> ");
+	    read(input,0x15);						<== CONTROL THIS
+	    selected_opt = atoi(input);					<== GOT OVERWRITTEN
+	    switch(selected_opt) { < callbacks for each case > }
+	  } while( true );
+	}
+
+This handler() calls something callback where we have arbitrary write primitive
+It means that we can find a base pointer of this callback and overwrite it to payload
+(for example - address near GOT sections)
+
+After callback's finish base pointer becomes our overwrited address
+
+	mov esp, ebp
+	pop ebp			<== HERE
+	ret
+
+It means that next cycle of handler() will calculate local variable addresses relative our rewritten base pointer
+So, input will becomes $ebp + 0x22. And if we put atoi@got - 0x22 to $ebp, read() will be called like 
+
+	read(atoi@got, 0x15);
+	
+And we'll overwrite atoi@got arbitrary data. For example - system() address concatenated with ";sh;"
+And next atoi() will be called like system(system + ";sh;")
+Command string interpreter will try to execute address of system, but won't can do it
+Next, it will look at the first ";" and will understand that prompt doesn't end and go to next command
+Which situaded at the left side from first ";". The second ";" to be sure that "sh" string terminated
+To be safe from garbage data from the right side from "sh"
+And we'll got a shell
 
 ================================================================================
 6. EXPLOITATION CASES: STEP-BY-STEP
