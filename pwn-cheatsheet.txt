@@ -545,12 +545,206 @@ Example:
     0x55f68ab792e0:  0x00007fc371619ce0  0x00007fc371619ce0  <- remainder after separation was put into unsorted
                                                                bin again
 
+================================================================================
+5. FILE-STREAM ORIENTED PROGRAMMING
+================================================================================
+
+File-stream oriented programming aka FSOP is technique which concept is _IO_FILE_plus struct's low-level callbacks overwrite
+via substitution of vtable (_IO_file_jumps struct) pointer or vtable struct's fields (just like GOT-overwrite) if it's possible
+
+5.1 key glibc FILE structures
+------------------------------------------------------------------------------
+
+This is a declaration of beginning of the FILE stucture :
+
+	struct _IO_FILE
+	{
+	  int _flags;		/* High-order word is _IO_MAGIC; rest is flags. */
+
+	  /* The following pointers correspond to the C++ streambuf protocol. */
+	  char *_IO_read_ptr;	/* Current read pointer */
+	  char *_IO_read_end;	/* End of get area. */
+	  char *_IO_read_base;	/* Start of putback+get area. */
+	  char *_IO_write_base;	/* Start of put area. */
+	  char *_IO_write_ptr;	/* Current put pointer. */
+	  char *_IO_write_end;	/* End of put area. */
+	  char *_IO_buf_base;	/* Start of reserve area. */
+	  char *_IO_buf_end;	/* End of reserve area. */
+
+	  /* The following fields are used to support backing up and undo. */
+	  char *_IO_save_base; /* Pointer to start of non-current get area. */
+	  char *_IO_backup_base;  /* Pointer to first valid character of backup area */
+	  char *_IO_save_end; /* Pointer to end of non-current get area. */
+
+	  struct _IO_marker *_markers;
+
+	  struct _IO_FILE *_chain;
+
+	  int _fileno;
+	  int _flags2;
+	  __off_t _old_offset; /* This used to be _offset but it's too small.  */
+
+	  /* 1+column number of pbase(); 0 is unknown. */
+	  unsigned short _cur_column;
+	  signed char _vtable_offset;
+	  char _shortbuf[1];
+
+	  _IO_lock_t *_lock;
+	  
+	  __off64_t _offset;
+	  void *_codecvt;
+	  void *_wide_data;      
+	  struct _IO_FILE *_freeres_list;
+	  void *_freeres_buf;
+	  size_t __pad5;
+	  int _mode;              
+	  char _unused2[15 * sizeof (int) - 4 * sizeof (void *) - sizeof (size_t)];
+	};
+	
+FILE hexdump (stdout for example):
+
+	0xf7fcbd60 <_IO_2_1_stdout_>:   	0xfbad2887      0xf7fcbda7      0xf7fcbda7      0xf7fcbda7	
+	0xf7fcbd70 <_IO_2_1_stdout_+16>:        0xf7fcbda7      0xf7fcbda7      0xf7fcbda7      0xf7fcbda7
+	0xf7fcbd80 <_IO_2_1_stdout_+32>:        0xf7fcbda8      0x00000000      0x00000000      0x00000000
+	0xf7fcbd90 <_IO_2_1_stdout_+48>:        0x00000000      0xf7fcb5a0      0x00000001      0x00000000
+	0xf7fcbda0 <_IO_2_1_stdout_+64>:        0xffffffff      0x0a000000      0xf7fcc870      0xffffffff
+	0xf7fcbdb0 <_IO_2_1_stdout_+80>:        0xffffffff      0x00000000      0xf7fcb4e0      0x00000000
+	0xf7fcbdc0 <_IO_2_1_stdout_+96>:        0x00000000      0x00000000      0xffffffff      0x00000000
+	0xf7fcbdd0 <_IO_2_1_stdout_+112>:       0x00000000      0x00000000      0x00000000      0x00000000
+	0xf7fcbde0 <_IO_2_1_stdout_+128>:       0x00000000      0x00000000      0x00000000      0x00000000
+	0xf7fcbdf0 <_IO_2_1_stdout_+144>:       0x00000000      0xf7fcaac0	<== _IO_jump_t
+	
+And this is a declaration of vtable structure :
+
+	struct _IO_jump_t
+	{
+	    JUMP_FIELD(size_t, __dummy);
+	    JUMP_FIELD(size_t, __dummy2);
+	    JUMP_FIELD(_IO_finish_t, __finish);
+	    JUMP_FIELD(_IO_overflow_t, __overflow);
+	    JUMP_FIELD(_IO_underflow_t, __underflow);
+	    JUMP_FIELD(_IO_underflow_t, __uflow);
+	    JUMP_FIELD(_IO_pbackfail_t, __pbackfail);
+	    /* showmany */
+	    JUMP_FIELD(_IO_xsputn_t, __xsputn);
+	    JUMP_FIELD(_IO_xsgetn_t, __xsgetn);
+	    JUMP_FIELD(_IO_seekoff_t, __seekoff);
+	    JUMP_FIELD(_IO_seekpos_t, __seekpos);
+	    JUMP_FIELD(_IO_setbuf_t, __setbuf);
+	    JUMP_FIELD(_IO_sync_t, __sync);
+	    JUMP_FIELD(_IO_doallocate_t, __doallocate);
+	    JUMP_FIELD(_IO_read_t, __read);
+	    JUMP_FIELD(_IO_write_t, __write);
+	    JUMP_FIELD(_IO_seek_t, __seek);
+	    JUMP_FIELD(_IO_close_t, __close);
+	    JUMP_FIELD(_IO_stat_t, __stat);
+	    JUMP_FIELD(_IO_showmanyc_t, __showmanyc);
+	    JUMP_FIELD(_IO_imbue_t, __imbue);
+	#if 0
+	    get_column;
+	    set_column;
+	#endif
+	};
+	
+Finally, whole FILE* struct includes both of that declarations :
+
+	struct _IO_FILE_plus
+	{
+	  _IO_FILE file;
+	  const struct _IO_jump_t *vtable;
+	};
+	
+So, as you can see - these are just a collection of meta-pointers and callbacks to handle any event (read/write/close and other) 
+
+5.2 What if we overwrite some fields?
+------------------------------------------------------------------------------
+
+For example, I explain you on created FILE via fopen. Look : man "fopen(3)". 
+It just creates _IO_FILE_plus at the heap and returns the pointer to created chunk.
+Standart file streams stored in libc address space.
+
+Ok, we have a several ways to reach control :
+
+	1. Overwrite pointer to _IO_FILE_plus	(fine, just overwrite pointer to prepared memory space with fake FILE, 
+						but we must do care about whole FILE with _IO_jump_t if we work in glibc >= 2.24)
+						
+	2. Overwrite pointer to _IO_jump_t	(well - don't touch whole FILE. Just substitute vtable pointer. 
+						But works only glibc < 2.24 if address isn't in libc range!)
+						
+	3. Overwrite concrete callback		(good - scoping fire without whole struct corruption, 
+						but if only vtables aren't in .rodata section - probably not)
+
+Each case need two conditions - arbitrary write & addresses knoledge.
+
+Let's suppose that you have the first case. You have overwritten the FILE pointer to your prepared menory space, suppose .data in binary with -no-pie.
+The best practice - copy initial _IO_FILE struct, just change vtable. 
+But depends to context we can set pointers what we need (read/write base/start/end ptrs, flags, markers and other), but this is already more advanced technique.
+
+When programm uses fclose() it pulls JUMP_FIELD(_IO_close_t, __close) from vtable (offset + 18 * BITS).
+It means that if we overwrite 18-th dword/qword (depends on i386/amd64 architecture), fclose will pull our address instead of original __close().
+p.s. it maybe pulls JUMP_FIELD(_IO_finish_t, __finish), but according my experience - firstly fclose trigger especially __close().
+
+fread() pulls JUMP_FIELD(_IO_xsgetn_t, __xsgetn). Offset 9-th dword/qword. The same logic, just like fclose, but another offset.
+fwrite() - JUMP_FIELD(_IO_xsputn_t, __xsputn). Offset 8-th.
+
+Another callbacks called from __close, __xsgetn/putn (mostly). 
+That's all what you need to know at the beginning.
+
+Well, but in the glibc 2.24 and newer versions we have a one obstacle - vtable address validation. 
+It must be in range of special space among libc addresses. 
+It means that we can't just overwrite vtable pointer to arbitrary address with fake vtable.
+All of these have become a cause of appearing of several following exploitation techniques.
+
+5.2 Vtable Protections Bypass
+------------------------------------------------------------------------------
+
+While glibc's absractions are having pointers to callbacks to next level of abstraction, hackers will find a way to pwn it.
+
+2. _IO_str_jumps (I took it's layout from https://github.com/lattera/glibc/blob/master/libio/strfile.h) :
+
+	If we are working with string-stream we'll work with special FILE structure :
+	
+		typedef struct _IO_strfile_ {
+		  struct _IO_streambuf _sbf;
+		  struct _IO_str_fields _s;			<== if we can modify this
+		} _IO_strfile;
+		
+	Where _sbf is :
+	
+		struct _IO_streambuf {
+		  _IO_FILE _f;
+		  const struct _IO_jump_t *vtable;
+		};
+		
+	And _s is :
+	
+		struct _IO_str_fields {
+		  /* These members are preserved for ABI compatibility.  The glibc
+		     implementation always calls malloc/free for user buffers if
+		     _IO_USER_BUF or _IO_FLAGS2_USER_WBUF are not set.  */
+		  _IO_alloc_type _allocate_buffer_unused;	<== we can modify this
+		  _IO_free_type _free_buffer_unused;		<== and this
+		};
+		
+	So, this "const struct _IO_jump_t *vtable" is _IO_str_jumps - special vtable for string-stream structs.
+	It has JUMP_FIELD(_IO_overflow_t, __overflow) field which uses this _IO_alloc_type _allocate_buffer_unused callback.
+	It means that if we overwrite this address and trigger __overflow we'll get arbitrary execution.
+	This callback takes an argument as a new_size of buffer and our problem transforms to solving of an equation with :
+	
+		char *_IO_buf_base;	/* Start of reserve area. */
+	  	char *_IO_buf_end;	/* End of reserve area. */
+	  	
+	  	new_size = 2 * old_size + 100, where old_size = _IO_buf_end - _IO_buf_base. (+100 as usual, but also can do +10. Need debug)
+	  	
+	  All of what we need - shift address of _IO_str_jumps so that target event (for example __xputn) pulls __overflow callback.
+	  As we now, it will use "_allocate_buffer_unused" and "_IO_buf_end & _IO_buf_base" which we can control.
+	  But don't forget to substitute buf pointers to write_ptr >= write_base to trigger "_allocate_buffer_unused" or try to do "honest" overflow.
 
 ================================================================================
-5. BONUS
+6. BONUS
 ================================================================================
 
-5.1 Off-By-One
+6.1 Off-By-One
 ------------------------------------------------------------------------------
 
 Sometimes a program doesn't check the condition when we are writing at an index
@@ -561,7 +755,7 @@ It can include max available values or metadata of the chunk header. If we
 rewrite it we can get control of critical structures to get access to something.
 
 
-5.2 PLT-Trampoline
+6.2 PLT-Trampoline
 ------------------------------------------------------------------------------
 
 If we have a not small primitive of writing to the .got section of our binary
@@ -622,7 +816,7 @@ I can even show a real case for you:
 
 We can just prepare a setcontext struct (ucontext_t as I remember) somewhere
 in memory and put its address to _GLOBAL_OFFSET_TABLE_+0x8 and put the address
-of setcontext + 32 to _GLOBAL_OFFSET_TABLE_+0x10.
+of setcontext + offset to pop rdx to _GLOBAL_OFFSET_TABLE_+0x10.
 
 It resets all registers including rsp and basically can give a reverse shell
 if we place in rdi "/bin/sh\0" and place RIP on system() with aligned RSP,
@@ -630,7 +824,7 @@ because we control it too. Or just make execve with stack pivoting.
 Your border is your imagination here ;)
 
 
-5.3 One Gadget
+6.3 One Gadget
 ------------------------------------------------------------------------------
 
 If we have only 1 qword (or dword if we are working with 32-bits) to overflow
@@ -688,7 +882,7 @@ if you haven't NULL pointers.
 P.s you probably will be faced with another "rules" of the one gadget
 For example - $esi must points to libc.got.plt section and other
 
-5.4 __libc_csu_init Exploitation aka ret2csu
+6.4 __libc_csu_init Exploitation aka ret2csu
 ------------------------------------------------------------------------------
 
 Every GCC binary (without -nostdlib compiling flag) has the __libc_csu_init
@@ -809,7 +1003,7 @@ Payload may look like:
     __libc_csu_init or just be a continuation of the ROP.
 
 
-5.5 Anyway Check What Stack / Heap / .data & .bss Includes
+6.5 Anyway Check What Stack / Heap / .data & .bss Includes
 ------------------------------------------------------------------------------
 
 When I was solving a task from pwnable.tw (deaslr 500) I faced a large writing
@@ -839,7 +1033,7 @@ In conclusion I must tell you that our deal is always guessing, discovering
 and hope that we'll find a way to pwn it. But of course, without brilliant
 technical knowledge this point is unreachable.
 
-5.6 .init_array / .fini_array overwrite
+6.6 .init_array / .fini_array overwrite
 ------------------------------------------------------------------------------
 
 When your process was deployed, first of all code _start (or another entry tag) was called
@@ -921,7 +1115,7 @@ or endless "cycle" of main. Let's look at the last way :
 		2) don't do this and pass one more main calling to after main's "ret" 
 		go to [ .fini_array + 0x10 ] ROP
 		
-5.7 Arguments control via $EBP/$RBP
+6.7 Arguments control via $EBP/$RBP
 ------------------------------------------------------------------------------
 
 In such cases when you have "partial" or full arbitrary write primitive & you have a stack leak
@@ -968,7 +1162,7 @@ Which situaded at the left side from first ";". The second ";" to be sure that "
 To be safe from garbage data from the right side from "sh"
 And we'll got a shell
 
-5.8 Condition issues
+6.8 Condition issues
 ------------------------------------------------------------------------------
 
 Sometimes process checks itself conditions after executing something
@@ -1002,7 +1196,7 @@ Look at the example (from re-alloc, pwnable.tw) :
     	But if we free chunk via reallocate with __size = 0 we'll free chunk but won't invalidate ptr
     	It means that we can do realloc() at this chunk again and overwrite 'fd' and 'bk' ptrs 
     	
-5.9 How to put fake chunk to unsorted bin
+6.9 How to put fake chunk to unsorted bin
 ------------------------------------------------------------------------------
 
 As we know, one way to leak libc address is free chunk to unsorted bin.
@@ -1024,7 +1218,7 @@ It means that I must do care about 3 consecutive chunks with 3 conditions :
 	
 Well, and after all of those my fake chunk really was freed to unsorted bin and via UAF I got libc leak.
 
-5.10 NX unknown
+6.10 NX unknown
 ------------------------------------------------------------------------------
 
 Unknown NX means that process isn't sure about memory protection of any page.
@@ -1047,138 +1241,6 @@ When checksec shows you :
 	Stripped:   No
 	
 It's a reason to try shellcoding if you can't find another way to pwn it ;)
-
-================================================================================
-6. FILE-STREAM ORIENTED PROGRAMMING
-================================================================================
-
-File-stream oriented programming aka FSOP is technique which concept is _IO_FILE_plus struct's low-level callbacks overwrite
-via substitution of vtable (_IO_file_jumps struct) pointer or vtable struct's fields (just like GOT-overwrite) if it's possible
-
-6.1 key glibc FILE structures
-------------------------------------------------------------------------------
-
-This is a declaration of beginning of the FILE stucture :
-
-	struct _IO_FILE
-	{
-	  int _flags;		/* High-order word is _IO_MAGIC; rest is flags. */
-
-	  /* The following pointers correspond to the C++ streambuf protocol. */
-	  char *_IO_read_ptr;	/* Current read pointer */
-	  char *_IO_read_end;	/* End of get area. */
-	  char *_IO_read_base;	/* Start of putback+get area. */
-	  char *_IO_write_base;	/* Start of put area. */
-	  char *_IO_write_ptr;	/* Current put pointer. */
-	  char *_IO_write_end;	/* End of put area. */
-	  char *_IO_buf_base;	/* Start of reserve area. */
-	  char *_IO_buf_end;	/* End of reserve area. */
-
-	  /* The following fields are used to support backing up and undo. */
-	  char *_IO_save_base; /* Pointer to start of non-current get area. */
-	  char *_IO_backup_base;  /* Pointer to first valid character of backup area */
-	  char *_IO_save_end; /* Pointer to end of non-current get area. */
-
-	  struct _IO_marker *_markers;
-
-	  struct _IO_FILE *_chain;
-
-	  int _fileno;
-	  int _flags2;
-	  __off_t _old_offset; /* This used to be _offset but it's too small.  */
-
-	  /* 1+column number of pbase(); 0 is unknown. */
-	  unsigned short _cur_column;
-	  signed char _vtable_offset;
-	  char _shortbuf[1];
-
-	  _IO_lock_t *_lock;
-	#ifdef _IO_USE_OLD_IO_FILE
-	};
-	
-FILE hexdump (stdout for example):
-
-	0xf7fcbd60 <_IO_2_1_stdout_>:   	0xfbad2887      0xf7fcbda7      0xf7fcbda7      0xf7fcbda7	
-	0xf7fcbd70 <_IO_2_1_stdout_+16>:        0xf7fcbda7      0xf7fcbda7      0xf7fcbda7      0xf7fcbda7
-	0xf7fcbd80 <_IO_2_1_stdout_+32>:        0xf7fcbda8      0x00000000      0x00000000      0x00000000
-	0xf7fcbd90 <_IO_2_1_stdout_+48>:        0x00000000      0xf7fcb5a0      0x00000001      0x00000000
-	0xf7fcbda0 <_IO_2_1_stdout_+64>:        0xffffffff      0x0a000000      0xf7fcc870      0xffffffff
-	0xf7fcbdb0 <_IO_2_1_stdout_+80>:        0xffffffff      0x00000000      0xf7fcb4e0      0x00000000
-	0xf7fcbdc0 <_IO_2_1_stdout_+96>:        0x00000000      0x00000000      0xffffffff      0x00000000
-	0xf7fcbdd0 <_IO_2_1_stdout_+112>:       0x00000000      0x00000000      0x00000000      0x00000000
-	0xf7fcbde0 <_IO_2_1_stdout_+128>:       0x00000000      0x00000000      0x00000000      0x00000000
-	0xf7fcbdf0 <_IO_2_1_stdout_+144>:       0x00000000      0xf7fcaac0	<== _IO_jump_t
-	
-And this is a declaration of vtable structure :
-
-	struct _IO_jump_t
-	{
-	    JUMP_FIELD(size_t, __dummy);
-	    JUMP_FIELD(size_t, __dummy2);
-	    JUMP_FIELD(_IO_finish_t, __finish);
-	    JUMP_FIELD(_IO_overflow_t, __overflow);
-	    JUMP_FIELD(_IO_underflow_t, __underflow);
-	    JUMP_FIELD(_IO_underflow_t, __uflow);
-	    JUMP_FIELD(_IO_pbackfail_t, __pbackfail);
-	    /* showmany */
-	    JUMP_FIELD(_IO_xsputn_t, __xsputn);
-	    JUMP_FIELD(_IO_xsgetn_t, __xsgetn);
-	    JUMP_FIELD(_IO_seekoff_t, __seekoff);
-	    JUMP_FIELD(_IO_seekpos_t, __seekpos);
-	    JUMP_FIELD(_IO_setbuf_t, __setbuf);
-	    JUMP_FIELD(_IO_sync_t, __sync);
-	    JUMP_FIELD(_IO_doallocate_t, __doallocate);
-	    JUMP_FIELD(_IO_read_t, __read);
-	    JUMP_FIELD(_IO_write_t, __write);
-	    JUMP_FIELD(_IO_seek_t, __seek);
-	    JUMP_FIELD(_IO_close_t, __close);
-	    JUMP_FIELD(_IO_stat_t, __stat);
-	    JUMP_FIELD(_IO_showmanyc_t, __showmanyc);
-	    JUMP_FIELD(_IO_imbue_t, __imbue);
-	#if 0
-	    get_column;
-	    set_column;
-	#endif
-	};
-	
-Finally, whole FILE* struct includes both of that declarations :
-
-	struct _IO_FILE_plus
-	{
-	  _IO_FILE file;
-	  const struct _IO_jump_t *vtable;
-	};
-	
-So, as you can see - these are just a collection of meta-pointers and callbacks to handle any event (read/write/close and other) 
-
-6.2 What if we overwrite some fields?
-------------------------------------------------------------------------------
-
-For example, I explain you on created FILE via fopen. Look : man "fopen(3)". 
-It just creates _IO_FILE_plus at the heap and returns the pointer to created chunk.
-Standart file streams stored in libc address space.
-
-Ok, we have a several ways to reach control :
-
-	1. Overwrite pointer to _IO_FILE_plus	(fine, just overwrite pointer to prepared memory space with fake FILE, but we must do care about whole FILE)
-	2. Overwrite pointer to _IO_jump_t	(well - don't touch whole FILE. Just substitute vtable pointer)
-	3. Overwrite concrete callback		(pretty good - scoping fire without whole struct corruption, but works only < 2.24 glibc)
-
-Each case need two conditions - arbitrary write & addresses knoledge.
-
-Let's suppose that you have the first case. You have overwritten the FILE pointer to your prepared menory space, suppose .data in binary with -no-pie.
-The best practice - copy initial _IO_FILE struct, just change vtable. 
-But depends to context we can set pointers what we need (read/write base/start/end ptrs, flags, markers and other), but this is already more advanced technique.
-
-When programm uses fclose() it pulls JUMP_FIELD(_IO_close_t, __close) from vtable (offset + 18 * BITS).
-It means that if we overwrite 18-th dword/qword (depends on i386/amd64 architecture), fclose will pull our address instead of original __close().
-p.s. it maybe pulls JUMP_FIELD(_IO_finish_t, __finish), but according my experience - firstly fclose trigger especially __close().
-
-fread() pulls JUMP_FIELD(_IO_xsgetn_t, __xsgetn). Offset 9-th dword/qword. The same logic, just like fclose, but another offset.
-fwrite() - JUMP_FIELD(_IO_xsputn_t, __xsputn). Offset 8-th.
-
-Another callbacks called from __close, __xsgetn/putn (mostly). 
-That's all what you need to know at the beginning.
 
 ===================================================================
 And don't forget : "control is an illusion, but a very useful one"
