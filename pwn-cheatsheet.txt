@@ -1,5 +1,5 @@
 ================================================================================
-                        NIGHTMARE CHEATSHEET by s4yHi
+                    BINARY EXPLOITATION MANUALS by s4yHi
 ================================================================================
 
 I advise you to read it if you already have any knowledge about PWN... but you
@@ -7,7 +7,6 @@ can find out something new that will be interesting to learn.
 At the bottom of this article you can find various concrete exploitation cases
 including those I have faced.
 Sorry for my imperfect English :)
-
 
 ================================================================================
 1. BASICS
@@ -436,7 +435,6 @@ is pushed into tcache.
        'a' will equal 'c' and if we write the safe-linked address to 'a',
        the next allocation will return a chunk at the rewritten address.
 
-
 3) MAIN ARENA BINS:
 
    3.1) Unsorted bin (index == 1) - this place is a FIFO cyclic-two-binded
@@ -544,6 +542,39 @@ Example:
                                                                next chunk]
     0x55f68ab792e0:  0x00007fc371619ce0  0x00007fc371619ce0  <- remainder after separation was put into unsorted
                                                                bin again
+
+4.4 House of Spirit
+------------------------------------------------------------------------------
+
+If process uses pointer which malloc returns and :
+	1. you can control it
+	2. you have an address of the target and you can control it's data
+you'll can use this technique to arbitrary write via malloc.
+
+All of you need - create 2 fake chunks. The second one after the first.
+With properly structure (header + data). But we actually only do care about headers of them.
+I advice you to add PREV_INUSE flags for both to bypass consolidation.
+
+And after that grooming you need to free the first of them via overwritten saved pointer.
+Allocator will interpretate the first chunk as valid because they have a valid structure.
+Let's repeat : data aligned, headers with PREV_INUSE, chunks have properly distance beetwen them.
+
+			   <header of 1st chunk>
+	0xffed1608:     0x00000000      0x00000041      0x61616161      0x61616161
+	0xffed1618:     0x61616161      0x61616161      0x61616161      0x61616161
+	0xffed1628:     0x61616161      0x61616161      0x61616161      0x61616161
+	0xffed1638:     0x61616161      0x61616161      0x61616161      0x61616161
+	0xffed1648:     0x00000000      0x00000041      <==  <header of 2nd chunk>
+	0xffed1658:     0xffed1678      0x08048908      0xf7fc1d60      0x080462a0
+	0xffed1668:     0x0804891b      0x00000000      0xf7fc1000      0xf7fc1000
+	0xffed1678:     0x00000000      0xf7e29637      0x00000001      0xffed1714
+	0xffed1688:     0xffed171c      0x00000000      0x00000000      0x00000000
+	
+As you can see, data doesn't matter (obviously).
+
+So, we need free chunk with address 0xffed1610 via ptr overwrite.
+After this it will be put into the tcache/fastbin and next allocation returns 0xffed1610.
+To free unsorted bin look at the bonus 6.9
 
 ================================================================================
 5. FILE-STREAM ORIENTED PROGRAMMING
