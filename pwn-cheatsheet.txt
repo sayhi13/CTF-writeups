@@ -362,8 +362,8 @@ is pushed into tcache.
    where counts has range [0, 7] (max 7 chunks at a bin) and entries include
    the address of the next chunk for allocation. So, size of tps is:
    2 * 64 + 8 * 64 = 640 = 0x280 bytes as usual (maybe it has alignment, be
-   sure that you are working with the proper size. With flag PREV_INUSE it
-   equals 0x281 bytes).
+   sure that you are working with the proper size. With header and flag PREV_INUSE it
+   equals 0x291 bytes).
 
    After free(), if a chunk was pushed to a tcache bin, the 2nd qword becomes a
    Safe-Linked address of the next free chunk and the 3rd qword becomes a key of
@@ -738,9 +738,9 @@ glibc < 2.30 :
 	My PoCs :
 	
 		Tail insertion :
-		
+
 			#include <stdlib.h>                                                                                                 
-                                                                                                                    
+
 			int main() {             
 				/* alloc 0x10 - layers to bypass consolidation */                                                                                           
 				char* a = malloc(0x100); malloc(0x10);                                                               
@@ -763,8 +763,6 @@ glibc < 2.30 :
 			}
 			
 		Head insertion :
-		
-			#include <stdlib.h>                                                                                                 
                                                                                                                     
 			int main() {                                                                                                        
 				char* a = malloc(0x100); malloc(0x10);                                                                      
@@ -789,7 +787,7 @@ glibc < 2.30 :
 	Firstly, look at the logic of the large bin chunk insertion and understand bin statement for each action.
 	p.s. I'll show link at schemas as "->" (fd) and "<-" (bk)
 	
-		1. Chunks at large bins can store chunks with determinated range of size : 
+		1. Chunks at large bins can store chunks with specified range of size : 
 			- from 64-th to 95-th bin (0-th - 32-nd large bin) bins have 64 bytes range :
 				0: 0x400 - 0x43f
 				1: 0x440 - 0x47f
@@ -801,7 +799,10 @@ glibc < 2.30 :
 			65-th bin : 	0x7ffff7dd1f88: 0x00007ffff7dd1f78      0x00007ffff7dd1f78
 						
 		   Because with this arch fd & bk field don't miss "forward & backward pointers semantic"
-		   So, address of 65-th bin is 0x00007ffff7dd1f78 and fwd/bck pointers as head can be taken via 
+		   So, address of 65-th bin is 0x00007ffff7dd1f78 and fwd/bck pointers as head can be taken via.
+		   
+		   I have to tell you that fwd and bck pointers can make you confuse because during malloc()
+		   execution they often redefine. To don't confuse I'll describe them for each redefinition.
 		   
 		   	fwd <=> 0x00007ffff7dd1f78->fd <=> *(0x00007ffff7dd1f78 + 0x10) <=> head
 		   	bck <=> 0x00007ffff7dd1f78->bk <=> *(0x00007ffff7dd1f78 + 0x18) <=> tail
@@ -840,6 +841,13 @@ glibc < 2.30 :
 			
 			4.1. First of all, allocator executing macro which determine : is chunk larger/smaller than current head/tail?
 			     This something like optimization to do one operation O(1) before traversal whole bin O(n) instead immediately traversal.
+			     It's looks like :
+			     
+			     	bck = <large bin>;
+			     	fwd = bck->fbk
+			     	if ( (unsigned long) size < (unsigned long) chunksize_nomask(bck->bk) ) { <tail fd_nextsize/bk_nextsize insertion logic> (look at 4.2.1.) }
+			     	else { <traversal to insert new head or insert between with fd_nextsize/bk_nextsize> (look at 4.3.1.) }
+			     	<linking with fd/bk>;
 			     
 			4.2. Chunk smaller that tail :
 			
@@ -856,22 +864,25 @@ glibc < 2.30 :
 						p.s. this image just for better imagination of cyclic double-linked list;
 						     if bin has just one chunk, this chunk already as HEAD as TAIL.
 							 
-						And allocator executes this code (P is our chunk):
+						And allocator executes this code (P is our chunk. Don't forget about bck is large bin address):
 						
-							P->fd_nextsize = fwd;			<== The smallest chunk (NEW TAIL) points to HEAD with fd_nextsize
-							P->bk_nextsize = fwd->bk_nextsize;	<== And to OLD TAIL (HEAD->bk_nextsize == OLD TAIL) with bk_nextsize
-							fwd->bk_nextsize = P;			<== Now HEAD points to NEW TAIL with bk_nextsize
-							P->bk_nextsize->fd_nextsize = P; 	<== Finally, OLD TAIL points to NEW TAIL with fd_nextsize
+							fwd = bck;						<== Now fwd is large bin address
+							bck = bck->bk;						<== And bck is the tail
+							
+							P->fd_nextsize = fwd->fd;				<== fwd->fd is head ( *(<large bin> + 0x10) == head )
+							P->bk_nextsize = fwd->fd->bk_nextsize;			<== head->bk_nextsize is the tail
+							
+							fwd->fd->bk_nextsize = P->bk_nextsize->fd_nextsize = P;	<== update head->bk_nextsize & link old tail with new
 
-							 --> HEAD (fwd) <-> A <-> B <-> C <-> OLD TAIL (still bck yet) <-> NEW TAIL <--
-							 |____________________________________________________________________________|
+							 --> HEAD <-> A <-> B <-> C <-> OLD TAIL <-> NEW TAIL <--
+							 |______________________________________________________|
 							 
 						The image in our case :
 						
 							before :					after :
 							
-								--> HEAD (fwd) & OLD TAIL (bck) <--		--> HEAD (fwd) (OLD TAIL) <-> NEW TAIL (bck) <--
-							 	|_________________________________|		|______________________________________________|
+								--> HEAD & OLD TAIL <--				--> HEAD (OLD TAIL) <-> NEW TAIL (bck) <--
+							 	|_____________________|				|________________________________________|
 							 	
 					4.2.2. fd/bk linking :
 					
@@ -888,7 +899,7 @@ glibc < 2.30 :
 							P->fd = fwd;			<== NEW TAIL point to main arena with fd
 							P->bk = bck;			<== and points to OLD TAIL with bk
 							bck->fd = P;			<== OLD TAIL point to NEW TAIL with fd
-							fwd->bk = P;			<== !! UPDATE !! TAIL at the bin (now bck from 4.2.1. is NEW TAIL)
+							fwd->bk = P;			<== !! UPDATE !! TAIL at the bin 
 							
 						It looks like :
 						
@@ -944,13 +955,15 @@ glibc < 2.30 :
 						--> NEW HEAD <-> OLD HEAD (still fwd yet) <-> A <-> B <-> C <-> TAIL (bck) <--
 						|____________________________________________________________________________|
 					
-					But allocator just executes those 4 strings of code from 4.2.1. because logic of CYCLIC double-linked list matches that method.
-					Let's check it out :
-						
-						1. Link NEW HEAD with OLD HEAD with fd_nextsize (P->fd_nextsize = fwd)
-						2. Link NEW HEAD with TAIL with bk_nextsize (P->bk_nextsize = fwd->bk_nextsize)
-						3. Link OLD HEAD with NEW HEAD with bk_nextsize (fwd->bk_nextsize = P)
-						4. Link TAIL with NEW HEAP with fd_nextsize (P->bk_nextsize->fd_nextsize = P)
+					When condition from 4.1. returns false, allocator makes traversal from bck to fwd, where bck and fd are still <large bin> and head.
+					But explanation of all of those breaks out of this manual. If you interested just check malloc.c source.
+					
+					So, when allocator detected that new chunk larger than head it does following code (fwd == head & bck == tail) :
+					
+						P->fd_nextsize = fwd;			<== Link NEW HEAD with OLD HEAD with fd_nextsize
+						P->bk_nextsize = fwd->bk_nextsize;	<== Link NEW HEAD with TAIL with bk_nextsize
+						fwd->bk_nextsize = P; 			<== Link OLD HEAD with NEW HEAD with bk_nextsize
+						P->bk_nextsize->fd_nextsize = P; 	<== Link TAIL with NEW HEAP with fd_nextsize
 						
 					Here we are! New head successfully was linked to the bin.
 					
@@ -978,18 +991,19 @@ glibc < 2.30 :
 		5. exploit tail insertion to reach once arbitrary write of heap address :
 		
 			If we have vuln (UAF/heap overflow/another arbitrary write) which helps us to put arbitrary address to fwd->bk_nextsize
-			we can put address of new tail threre (just put target - 0x20 to shot into fd_nextsize field) :
+			we can put address of new tail threre (just put target - 0x20 to shot into fd_nextsize field).
+			And you must overwrite bk_nextsize of head because fwd is bin pointer
 			
-				*((long*)b + 3) = val - 0x20;		<== now fwd->bk_nextsize = target - 0x20
+				*((long*)b + 3) = val - 0x20;		<== now fwd->fd->bk_nextsize = target - 0x20
 			
-			And look at 4.2.1. we can find : 
+			And look at 4.2.1. we can find (fwd is bin address) : 
 				
-				P->bk_nextsize = fwd->bk_nextsize;	<== And to OLD TAIL (HEAD->bk_nextsize == OLD TAIL) with bk_nextsize
+				P->bk_nextsize = fwd->fd->bk_nextsize;	<== New tail points to target - 0x20 with bk_nextsize
 				
 			It means that allocator trust to head's bk_nextsize (pointer to tail) and links new tail with old tail with bk_nextsize.
 			And 1 string of code later :
 			
-				P->bk_nextsize->fd_nextsize = P; 	<== Finally, OLD TAIL points to NEW TAIL with fd_nextsize
+				P->bk_nextsize->fd_nextsize = P; 	<== Finally, OLD (fake) TAIL points to NEW TAIL via fd_nextsize
 				
 			Where P->bk_nextsize == target - 0x20. It means that *(target - 0x20 + <fd_nextsize offset>) becomes P.
 			That's all about tail insertion :)
@@ -1059,7 +1073,20 @@ glibc < 2.30 :
 	
 glibc >= 2.30 :
 
-	Coming soon ...
+	After 2.30 patch "else" block (from 4.1) includes following macros :
+	
+		1. Before fd_nextsize/bk_nextsize linking (fwd is a head and bck is a tail) :
+		
+			if ( __glibc_unlikely (fwd->bk_nextsize->fd_nextsize != fwd) )
+				malloc_printerr ("malloc(): largebin double linked list corrupted (nextsize)");
+
+		2. Before fd/bk libking (bck is a bin address, fwd is a head) :
+		
+			if (bck->fd != fwd) 
+				malloc_printerr ("malloc(): largebin double linked list corrupted (bk)");
+			
+	But... Block "if" doesn't include these macros. It actually means that we can just do tail insertion technique from 4.2. ;)
+
 
 ================================================================================
 5. FILE-STREAM ORIENTED PROGRAMMING
